@@ -92,7 +92,7 @@ impl fmt::Debug for ReadSource {
 pub type Input = ReadSource;
 
 /// Limits and request settings used while acquiring a document.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ReadOptions {
     pub base_url: Option<Url>,
     pub timeout: Duration,
@@ -101,6 +101,8 @@ pub struct ReadOptions {
     /// An exact User-Agent value, or `None` to select the automatic profile.
     pub user_agent: Option<String>,
     pub accept_language: Option<String>,
+    /// Cookies for direct URL acquisition only. Never written to results.
+    pub cookies: Option<crate::cookie::CookieSource>,
 }
 
 impl Default for ReadOptions {
@@ -112,7 +114,22 @@ impl Default for ReadOptions {
             max_bytes: DEFAULT_MAX_BYTES,
             user_agent: None,
             accept_language: None,
+            cookies: None,
         }
+    }
+}
+
+impl std::fmt::Debug for ReadOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadOptions")
+            .field("base_url", &self.base_url)
+            .field("timeout", &self.timeout)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("max_bytes", &self.max_bytes)
+            .field("user_agent", &self.user_agent)
+            .field("accept_language", &self.accept_language)
+            .field("cookies", &self.cookies.as_ref().map(|_| "[redacted]"))
+            .finish()
     }
 }
 

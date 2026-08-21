@@ -4,8 +4,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use opsail_read::{
-    CapturedDocument, CdpSource, CdpWaitUntil, ChromeError, ChromeSource, ReadError, ReadOptions,
-    ReadResult, ReadSource, read,
+    CapturedDocument, CdpSource, CdpWaitUntil, ChromeError, ChromeSource, CookieSource, ReadError,
+    ReadOptions, ReadResult, ReadSource, read,
 };
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
@@ -83,6 +83,7 @@ enum MachineSource {
 struct MachineOptions {
     timeout_ms: Option<u64>,
     max_bytes: Option<usize>,
+    cookie_file: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -248,6 +249,25 @@ impl MachineRequest {
             }
             options.max_bytes = max_bytes;
         }
+        if let Some(cookie_file) = self.options.cookie_file {
+            if cookie_file.is_empty() {
+                return Err(MachineFailure::invalid_option(
+                    "options.cookieFile must not be empty",
+                ));
+            }
+            options.cookies = Some(CookieSource::from_file(PathBuf::from(cookie_file)).map_err(
+                |error| match error {
+                    ReadError::ReadFile { path, .. } => MachineFailure::invalid_option(format!(
+                        "options.cookieFile could not be read: {}",
+                        path.display()
+                    )),
+                    ReadError::NotRegularFile { .. } => {
+                        MachineFailure::invalid_option("options.cookieFile must be a regular file")
+                    }
+                    error => MachineFailure::invalid_option(format!("options.cookieFile: {error}")),
+                },
+            )?);
+        }
 
         let input = match self.source {
             MachineSource::Url {
@@ -408,6 +428,36 @@ impl MachineFailure {
                 "url-contains-credentials",
                 FailureStage::Input,
                 "source URLs must not contain embedded credentials",
+            ),
+            ReadError::CookieRequiresUrl => Self::new(
+                "cookie-requires-url",
+                FailureStage::Input,
+                "Cookie is only supported for direct HTTP(S) URL sources",
+            ),
+            ReadError::InvalidCookieHeader => Self::new(
+                "invalid-cookie",
+                FailureStage::Input,
+                "Cookie header must be a single line without CR or LF",
+            ),
+            ReadError::EmptyNetscapeCookies => Self::new(
+                "invalid-cookie",
+                FailureStage::Input,
+                "Netscape cookie file contains no usable records",
+            ),
+            ReadError::InvalidCookieHeaderBytes => Self::new(
+                "invalid-cookie",
+                FailureStage::Input,
+                "Cookie header contains bytes that are not allowed in an HTTP header",
+            ),
+            ReadError::CookieCrossOriginRedirect { .. } => Self::new(
+                "cookie-redirect-refused",
+                FailureStage::Acquire,
+                "cookie is not forwarded across origins",
+            ),
+            ReadError::TooManyRedirects { .. } => Self::new(
+                "request-failed",
+                FailureStage::Acquire,
+                "source request exceeded the redirect limit",
             ),
             ReadError::InputTooLarge { limit } => Self::new(
                 "input-too-large",

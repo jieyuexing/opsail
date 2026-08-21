@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use opsail_read::{Input, ReadError, ReadOptions, SourceKind, read};
+use opsail_read::{CookieSource, Input, ReadError, ReadOptions, SourceKind, read};
 use tempfile::tempdir;
 use url::Url;
 use wiremock::matchers::{header, method, path};
@@ -186,6 +186,189 @@ async fn sends_the_configured_user_agent() {
     let url = Url::parse(&format!("{}/article", server.uri())).unwrap();
     let result = read(Input::Url(url), &options).await.unwrap();
 
+    assert!(result.content.contains("A readable local note"));
+}
+
+#[tokio::test]
+async fn sends_the_configured_cookie_on_direct_http() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/private"))
+        .and(header("cookie", "sid=authorized-session"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/html")
+                .set_body_string(HTML),
+        )
+        .mount(&server)
+        .await;
+    let options = ReadOptions {
+        cookies: Some(CookieSource::header("sid=authorized-session").unwrap()),
+        ..ReadOptions::default()
+    };
+
+    let url = Url::parse(&format!("{}/private", server.uri())).unwrap();
+    let result = read(Input::Url(url), &options).await.unwrap();
+
+    assert!(result.content.contains("A readable local note"));
+    assert!(!result.source.requested.contains("authorized-session"));
+}
+
+#[tokio::test]
+async fn netscape_cookie_file_sends_only_the_request_host() {
+    let server = MockServer::start().await;
+    let host = Url::parse(&server.uri())
+        .unwrap()
+        .host_str()
+        .unwrap()
+        .to_owned();
+    Mock::given(method("GET"))
+        .and(path("/private"))
+        .and(header("cookie", "sid=authorized-session"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/html")
+                .set_body_string(HTML),
+        )
+        .mount(&server)
+        .await;
+    let netscape = format!(
+        "# Netscape HTTP Cookie File\n\
+         .youtube.com\tTRUE\t/\tTRUE\t2147483647\tsid\tmust-not-send\n\
+         {host}\tFALSE\t/\tFALSE\t0\tsid\tauthorized-session\n"
+    );
+    let options = ReadOptions {
+        cookies: Some(CookieSource::parse(&netscape).unwrap()),
+        ..ReadOptions::default()
+    };
+    let url = Url::parse(&format!("{}/private", server.uri())).unwrap();
+    let result = read(Input::Url(url), &options).await.unwrap();
+    assert!(result.content.contains("A readable local note"));
+}
+
+#[tokio::test]
+async fn rejects_cookie_on_file_sources() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("note.html");
+    std::fs::write(&path, HTML).unwrap();
+    let options = ReadOptions {
+        cookies: Some(CookieSource::header("sid=authorized-session").unwrap()),
+        ..ReadOptions::default()
+    };
+
+    let error = read(Input::File(path), &options).await.unwrap_err();
+
+    assert!(matches!(error, ReadError::CookieRequiresUrl));
+}
+
+#[tokio::test]
+async fn rejects_cookie_header_injection() {
+    let options = ReadOptions {
+        cookies: Some(CookieSource::Header("sid=one\nX-Injected: yes".to_owned())),
+        ..ReadOptions::default()
+    };
+    let url = Url::parse("https://example.test/private").unwrap();
+
+    let error = read(Input::Url(url), &options).await.unwrap_err();
+
+    assert!(matches!(error, ReadError::InvalidCookieHeader));
+}
+
+#[tokio::test]
+async fn does_not_forward_cookies_across_origins() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/start"))
+        .respond_with(
+            ResponseTemplate::new(302).insert_header("location", "https://example.test/x"),
+        )
+        .mount(&server)
+        .await;
+    let options = ReadOptions {
+        cookies: Some(CookieSource::header("sid=authorized-session").unwrap()),
+        timeout: Duration::from_secs(5),
+        ..ReadOptions::default()
+    };
+    let url = Url::parse(&format!("{}/start", server.uri())).unwrap();
+
+    let error = read(Input::Url(url), &options).await.unwrap_err();
+
+    match error {
+        ReadError::CookieCrossOriginRedirect { url: rejected } => {
+            assert!(rejected.contains("example.test"));
+            assert!(!rejected.contains("authorized-session"));
+        }
+        other => panic!("expected cookie redirect error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn follows_same_origin_redirects_with_cookies() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/start"))
+        .and(header("cookie", "sid=authorized-session"))
+        .respond_with(ResponseTemplate::new(302).insert_header("location", "/private"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/private"))
+        .and(header("cookie", "sid=authorized-session"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/html")
+                .set_body_string(HTML),
+        )
+        .mount(&server)
+        .await;
+    let options = ReadOptions {
+        cookies: Some(CookieSource::header("sid=authorized-session").unwrap()),
+        timeout: Duration::from_secs(5),
+        ..ReadOptions::default()
+    };
+    let url = Url::parse(&format!("{}/start", server.uri())).unwrap();
+    let result = read(Input::Url(url), &options).await.unwrap();
+    assert!(result.content.contains("A readable local note"));
+    assert_eq!(
+        result.source.resolved_url.as_ref().map(Url::path),
+        Some("/private")
+    );
+}
+
+#[tokio::test]
+async fn netscape_cookies_are_rebound_after_a_same_host_redirect() {
+    let server = MockServer::start().await;
+    let host = Url::parse(&server.uri())
+        .unwrap()
+        .host_str()
+        .unwrap()
+        .to_owned();
+    Mock::given(method("GET"))
+        .and(path("/start"))
+        .respond_with(ResponseTemplate::new(302).insert_header("location", "/private"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/private"))
+        .and(header("cookie", "sid=authorized-session"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/html")
+                .set_body_string(HTML),
+        )
+        .mount(&server)
+        .await;
+    let netscape = format!(
+        "# Netscape HTTP Cookie File\n\
+         {host}\tFALSE\t/private\tFALSE\t0\tsid\tauthorized-session\n"
+    );
+    let options = ReadOptions {
+        cookies: Some(CookieSource::parse(&netscape).unwrap()),
+        timeout: Duration::from_secs(5),
+        ..ReadOptions::default()
+    };
+    let url = Url::parse(&format!("{}/start", server.uri())).unwrap();
+    let result = read(Input::Url(url), &options).await.unwrap();
     assert!(result.content.contains("A readable local note"));
 }
 

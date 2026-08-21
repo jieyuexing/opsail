@@ -147,7 +147,11 @@ control-character-sanitized `diagnostic` string; structured native failures keep
 their typed message authoritative instead of copying stderr.
 
 `options.timeoutMs` controls native acquisition; extraction and bounded cleanup
-can finish afterward. Unless
+can finish afterward. `options.cookieFile` is a path to one Cookie header line
+or a Netscape cookie file and is honored only for `url` sources, not `chrome` or
+`cdp`. A header line is sent as-is to the request URL; Netscape records are
+matched to host, path, and scheme. Cookie values are never written to results.
+Unless
 `createOpsail({ hardTimeoutMs })` explicitly sets the process deadline, the Node
 wrapper uses `max(30_000, options.timeoutMs + 10_000)` milliseconds. The extra
 time lets extraction finish and an owned Chrome process shut down after a native

@@ -55,7 +55,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 `ReadOptions` controls the base URL, request and connection timeouts, maximum
-input size, `User-Agent`, and `Accept-Language` header. For direct HTTP
+input size, `User-Agent`, `Accept-Language`, and optional cookies via
+`CookieSource`. Cookie is honored only for direct HTTP(S) URL sources; it is
+never written to `ReadResult`, logs, or diagnostics. A header-line source is
+sent as-is to the request URL. A Netscape cookie file is matched to the request
+host, path, and scheme. Same-host HTTP to HTTPS redirects re-match Netscape
+cookies; other-host and HTTPS to HTTP redirects are refused. For direct HTTP
 acquisition, leaving `user_agent` as `None` sends `opsail/<version>`; WeChat
 article URLs retain their browser-compatible automatic HTTP profile with an
 `opsail/<version>` product token. An explicit value always wins.
