@@ -267,6 +267,65 @@ fn url_source_credentials_are_rejected_without_echoing_them() {
 }
 
 #[test]
+fn cookie_file_missing_does_not_echo_a_secret() {
+    let mut command = cargo_bin_cmd!("opsail");
+    command
+        .args([
+            "read",
+            "--cookie-file",
+            "/no-such-opsail-cookie-session",
+            "https://example.test/private",
+        ])
+        .assert()
+        .code(1)
+        .stdout("")
+        .stderr(
+            predicate::str::contains("failed to read cookie file")
+                .and(predicate::str::contains("session-secret").not()),
+        );
+}
+
+#[test]
+fn cookie_file_empty_netscape_does_not_call_it_a_header_line() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("cookies.txt");
+    fs::write(&path, "# Netscape HTTP Cookie File\n").unwrap();
+    let mut command = cargo_bin_cmd!("opsail");
+    command
+        .args([
+            "read",
+            "--cookie-file",
+            path.to_str().unwrap(),
+            "https://example.test/private",
+        ])
+        .assert()
+        .code(1)
+        .stdout("")
+        .stderr(
+            predicate::str::contains("no usable records")
+                .and(predicate::str::contains("single line").not()),
+        );
+}
+
+#[test]
+fn cookie_file_conflicts_with_launch_and_cdp() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("cookies.txt");
+    fs::write(&path, "sid=authorized-session\n").unwrap();
+    let cookie = path.to_str().unwrap();
+    for extra in [&["--launch"][..], &["--cdp", "9222"][..]] {
+        let mut command = cargo_bin_cmd!("opsail");
+        let mut args = vec!["read", "--cookie-file", cookie];
+        args.extend_from_slice(extra);
+        args.push("https://example.test/private");
+        command.args(args).assert().code(2).stdout("").stderr(
+            predicate::str::contains("cannot be used with")
+                .and(predicate::str::contains("authorized-session").not()),
+        );
+    }
+}
+
+#[test]
 fn read_help_is_successful_and_stays_on_stdout() {
     let mut command = cargo_bin_cmd!("opsail");
     command
@@ -276,6 +335,7 @@ fn read_help_is_successful_and_stays_on_stdout() {
         .stdout(
             predicate::str::contains("--format")
                 .and(predicate::str::contains("--user-agent"))
+                .and(predicate::str::contains("--cookie-file <PATH>"))
                 .and(predicate::str::contains("--cdp <ENDPOINT>"))
                 .and(predicate::str::contains("--launch"))
                 .and(predicate::str::contains("--chrome-path <PATH>"))
@@ -631,6 +691,66 @@ fn machine_mode_validates_options_structurally() {
     let response: serde_json::Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
 
     assert_eq!(response["error"]["code"], "invalid-option");
+}
+
+#[test]
+fn machine_mode_rejects_unreadable_cookie_file() {
+    let request = serde_json::json!({
+        "protocolVersion": 1,
+        "source": {
+            "kind": "url",
+            "url": "https://example.test/private"
+        },
+        "options": {
+            "cookieFile": "/no-such-opsail-cookie-session"
+        }
+    });
+    let mut command = cargo_bin_cmd!("opsail");
+    let assert = command
+        .args(["read", "--machine"])
+        .write_stdin(request.to_string())
+        .assert()
+        .code(1)
+        .stderr("");
+    let response: serde_json::Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
+
+    assert_eq!(response["error"]["code"], "invalid-option");
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("could not be read")
+    );
+}
+
+#[test]
+fn machine_mode_rejects_empty_netscape_cookie_file() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("cookies.txt");
+    fs::write(&path, "# Netscape HTTP Cookie File\n").unwrap();
+    let request = serde_json::json!({
+        "protocolVersion": 1,
+        "source": {
+            "kind": "url",
+            "url": "https://example.test/private"
+        },
+        "options": {
+            "cookieFile": path.to_str().unwrap()
+        }
+    });
+    let mut command = cargo_bin_cmd!("opsail");
+    let assert = command
+        .args(["read", "--machine"])
+        .write_stdin(request.to_string())
+        .assert()
+        .code(1)
+        .stderr("");
+    let response: serde_json::Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
+
+    assert_eq!(response["error"]["code"], "invalid-option");
+    let message = response["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("Netscape cookie file contains no usable records"));
+    assert!(!message.contains("single line"));
 }
 
 #[test]

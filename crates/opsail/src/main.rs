@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use miette::{IntoDiagnostic, Result, WrapErr, miette};
-use opsail_read::{CdpSource, CdpWaitUntil, ChromeSource, Input, ReadOptions, ReadResult, read};
+use opsail_read::{
+    CdpSource, CdpWaitUntil, ChromeSource, CookieSource, Input, ReadOptions, ReadResult, read,
+};
 use serde_json::Value;
 use tokio::io::AsyncReadExt;
 use tracing_subscriber::{EnvFilter, util::SubscriberInitExt};
@@ -77,6 +79,7 @@ struct ReadArgs {
             "max_bytes",
             "user_agent",
             "accept_language",
+            "cookie_file",
             "cdp",
             "launch",
             "chrome_path",
@@ -160,6 +163,14 @@ struct ReadArgs {
     /// Accept-Language used for HTTP requests or Chrome CDP navigation.
     #[arg(long, value_name = "VALUE")]
     accept_language: Option<String>,
+
+    /// Cookie header line or Netscape cookie file for a direct HTTP(S) URL. A header line is sent as-is to the request URL. Netscape records are matched to host, path, and scheme. Not used with --launch or --cdp.
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with_all = ["cdp", "launch", "chrome_path"]
+    )]
+    cookie_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -311,6 +322,20 @@ fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
         })
 }
 
+fn load_cookie_file(path: &Path) -> Result<CookieSource> {
+    match CookieSource::from_file(path) {
+        Ok(source) => Ok(source),
+        Err(opsail_read::ReadError::ReadFile { source, .. }) => Err(source)
+            .into_diagnostic()
+            .wrap_err(format!("failed to read cookie file {}", path.display())),
+        Err(opsail_read::ReadError::NotRegularFile { .. }) => Err(miette!(
+            "cookie file {} is not a regular file",
+            path.display()
+        )),
+        Err(error) => Err(miette!("cookie file {}: {error}", path.display())),
+    }
+}
+
 async fn run(command: Command) -> Result<()> {
     match command {
         Command::Read(args) => run_read(*args).await,
@@ -343,6 +368,7 @@ async fn run_read(args: ReadArgs) -> Result<()> {
         max_bytes,
         user_agent,
         accept_language,
+        cookie_file,
     } = args;
 
     if let Some(base_url) = &base_url {
@@ -362,6 +388,9 @@ async fn run_read(args: ReadArgs) -> Result<()> {
     options.user_agent = user_agent;
     if let Some(accept_language) = accept_language {
         options.accept_language = Some(accept_language);
+    }
+    if let Some(cookie_file) = cookie_file {
+        options.cookies = Some(load_cookie_file(&cookie_file)?);
     }
 
     let requested_browser_wait = wait_until.is_some();

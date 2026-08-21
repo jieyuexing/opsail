@@ -10,6 +10,24 @@ pub enum ReadError {
     #[error("URL must not contain embedded credentials")]
     UrlContainsCredentials,
 
+    #[error("Cookie is only supported for direct HTTP(S) URL sources")]
+    CookieRequiresUrl,
+
+    #[error("Cookie header must be a single line without CR or LF")]
+    InvalidCookieHeader,
+
+    #[error("Netscape cookie file contains no usable records")]
+    EmptyNetscapeCookies,
+
+    #[error("Cookie header contains bytes that are not allowed in an HTTP header")]
+    InvalidCookieHeaderBytes,
+
+    #[error("cookie is not forwarded across origins")]
+    CookieCrossOriginRedirect { url: String },
+
+    #[error("request for `{url}` exceeded the redirect limit")]
+    TooManyRedirects { url: String },
+
     #[error("input exceeds the {limit} byte limit")]
     InputTooLarge { limit: usize },
 

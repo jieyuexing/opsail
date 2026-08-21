@@ -54,6 +54,13 @@ export interface ReadRequest {
     /** Native acquisition deadline; extraction and bounded cleanup may run afterward. */
     timeoutMs?: number;
     maxBytes?: number;
+    /**
+     * Path to a Cookie header line or Netscape cookie file.
+     * URL sources only; not used with chrome or cdp sources.
+     * A header line is sent as-is to the request URL. Netscape records are
+     * matched to host, path, and scheme.
+     */
+    cookieFile?: string;
   };
 }
 

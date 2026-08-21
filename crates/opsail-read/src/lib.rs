@@ -1,5 +1,6 @@
 //! Agent-ready HTML acquisition and readable content extraction.
 
+mod cookie;
 mod error;
 mod extract;
 mod model;
@@ -12,6 +13,7 @@ use std::time::Instant;
 use unicode_segmentation::UnicodeSegmentation;
 use url::Url;
 
+pub use cookie::CookieSource;
 pub use error::ReadError;
 pub use model::{
     CapturedDocument, DEFAULT_CONNECT_TIMEOUT, DEFAULT_MAX_BYTES, DEFAULT_MAX_DEPTH,
@@ -127,6 +129,17 @@ fn quality_grade(content_characters: usize, word_count: usize) -> QualityGrade {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_options_debug_redacts_cookies() {
+        let options = ReadOptions {
+            cookies: Some(CookieSource::header("sid=super-secret-session").unwrap()),
+            ..ReadOptions::default()
+        };
+        let debug = format!("{options:?}");
+        assert!(!debug.contains("super-secret-session"));
+        assert!(debug.contains("[redacted]"));
+    }
 
     #[test]
     fn extracts_an_in_memory_document() {

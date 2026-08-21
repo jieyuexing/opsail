@@ -6,7 +6,9 @@ use opsail_chrome::{
     CaptureOptions, CapturedPage, CdpSource, ChromeError, ChromeSource, RenderedPageEvidence,
     capture_cdp_with_probes, capture_chrome_with_probes,
 };
-use reqwest::header::{ACCEPT, ACCEPT_LANGUAGE, CONTENT_LENGTH, CONTENT_TYPE};
+use reqwest::header::{
+    ACCEPT, ACCEPT_LANGUAGE, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HeaderValue, LOCATION,
+};
 use tokio::io::AsyncReadExt;
 use url::Url;
 
@@ -42,6 +44,9 @@ enum VerificationContext {
 pub(crate) async fn load(input: Input, options: &ReadOptions) -> Result<LoadedDocument, ReadError> {
     if let Some(base_url) = &options.base_url {
         validate_web_url(base_url)?;
+    }
+    if options.cookies.is_some() && !matches!(input, Input::Url(_)) {
+        return Err(ReadError::CookieRequiresUrl);
     }
 
     let loaded = load_unchecked(input, options).await?;
@@ -276,23 +281,47 @@ async fn load_url(url: Url, options: &ReadOptions) -> Result<LoadedDocument, Rea
     INSTALL_TLS_PROVIDER.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
+    let cookie_source = options.cookies.as_ref();
     let client = reqwest::Client::builder()
         .user_agent(request_user_agent(&url, options.user_agent.as_deref()))
         .connect_timeout(options.connect_timeout)
         .timeout(options.timeout)
-        .redirect(redirect_policy())
+        .redirect(if cookie_source.is_some() {
+            reqwest::redirect::Policy::none()
+        } else {
+            redirect_policy()
+        })
         .build()
         .map_err(ReadError::BuildClient)?;
 
-    let mut request = client.get(url.clone()).header(ACCEPT, ACCEPT_VALUE);
-    if let Some(language) = &options.accept_language {
-        request = request.header(ACCEPT_LANGUAGE, language);
-    }
-
-    let response = request.send().await.map_err(|source| ReadError::Request {
-        url: url.to_string(),
-        source: source.without_url(),
-    })?;
+    let mut current = url.clone();
+    let mut hops = 0usize;
+    let response = loop {
+        let cookie = match cookie_source {
+            Some(source) => source.header_for_url(&current)?,
+            None => None,
+        };
+        let response = send_direct_get(&client, &current, options, cookie.as_deref()).await?;
+        if cookie_source.is_none() {
+            break response;
+        }
+        let Some(next) = redirect_target(&current, &response) else {
+            break response;
+        };
+        hops += 1;
+        if hops > 10 {
+            return Err(ReadError::TooManyRedirects {
+                url: url.to_string(),
+            });
+        }
+        validate_web_url(&next)?;
+        if !cookie_redirect_allowed(&current, &next) {
+            return Err(ReadError::CookieCrossOriginRedirect {
+                url: next.to_string(),
+            });
+        }
+        current = next;
+    };
     let status = response.status();
     let final_url = response.url().clone();
     validate_web_url(&final_url)?;
@@ -453,18 +482,49 @@ fn url_has_credentials(url: &Url) -> bool {
     !url.username().is_empty() || url.password().is_some()
 }
 
+async fn send_direct_get(
+    client: &reqwest::Client,
+    url: &Url,
+    options: &ReadOptions,
+    cookie: Option<&str>,
+) -> Result<reqwest::Response, ReadError> {
+    let mut request = client.get(url.clone()).header(ACCEPT, ACCEPT_VALUE);
+    if let Some(language) = &options.accept_language {
+        request = request.header(ACCEPT_LANGUAGE, language);
+    }
+    if let Some(cookie) = cookie {
+        let value =
+            HeaderValue::from_str(cookie).map_err(|_| ReadError::InvalidCookieHeaderBytes)?;
+        request = request.header(COOKIE, value);
+    }
+    request.send().await.map_err(|source| ReadError::Request {
+        url: url.to_string(),
+        source: source.without_url(),
+    })
+}
+
+fn redirect_target(current: &Url, response: &reqwest::Response) -> Option<Url> {
+    if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+        return None;
+    }
+    let value = response.headers().get(LOCATION)?.to_str().ok()?;
+    current.join(value).ok()
+}
+
+fn cookie_redirect_allowed(previous: &Url, next: &Url) -> bool {
+    previous.host() == next.host() && !(previous.scheme() == "https" && next.scheme() == "http")
+}
+
 fn redirect_policy() -> reqwest::redirect::Policy {
     let limit = reqwest::redirect::Policy::limited(10);
     reqwest::redirect::Policy::custom(move |attempt| {
-        let rejection = {
-            let next = attempt.url();
-            if !matches!(next.scheme(), "http" | "https") {
-                Some("redirect target scheme is not allowed")
-            } else if url_has_credentials(next) {
-                Some("redirect target credentials are not allowed")
-            } else {
-                None
-            }
+        let next = attempt.url();
+        let rejection = if !matches!(next.scheme(), "http" | "https") {
+            Some("redirect target scheme is not allowed")
+        } else if url_has_credentials(next) {
+            Some("redirect target credentials are not allowed")
+        } else {
+            None
         };
 
         match rejection {
@@ -702,6 +762,19 @@ mod tests {
 
         let unrelated = Url::parse("https://example.test/article").unwrap();
         assert_eq!(request_user_agent(&unrelated, None), DEFAULT_USER_AGENT);
+    }
+
+    #[test]
+    fn cookie_redirects_allow_same_host_http_to_https() {
+        let http = Url::parse("http://app.example.test/start").unwrap();
+        let https = Url::parse("https://app.example.test/app").unwrap();
+        let other = Url::parse("https://other.example.test/app").unwrap();
+        let path = Url::parse("http://app.example.test/app").unwrap();
+
+        assert!(cookie_redirect_allowed(&http, &https));
+        assert!(cookie_redirect_allowed(&http, &path));
+        assert!(!cookie_redirect_allowed(&https, &http));
+        assert!(!cookie_redirect_allowed(&http, &other));
     }
 
     #[test]
