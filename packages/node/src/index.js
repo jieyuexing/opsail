@@ -7,6 +7,11 @@ export async function read(request, options) {
   return defaultClient.read(request, options);
 }
 
+export async function usage(request, options) {
+  defaultClient ??= createOpsail();
+  return defaultClient.usage(request, options);
+}
+
 export { opsailPath } from "./binary.js";
 export { createOpsail } from "./client.js";
 export { OpsailError } from "./errors.js";

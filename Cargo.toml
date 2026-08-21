@@ -4,6 +4,7 @@ members = [
     "crates/opsail-chrome",
     "crates/opsail-read",
     "crates/opsail-refit-codex",
+    "crates/opsail-usage",
 ]
 resolver = "3"
 

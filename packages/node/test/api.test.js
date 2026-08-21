@@ -10,6 +10,7 @@ import {
   createOpsail,
   opsailPath,
   read,
+  usage,
 } from "../src/index.js";
 
 const executable = process.platform === "win32" ? "opsail.exe" : "opsail";
@@ -152,6 +153,24 @@ test("read reports a missing native binary without parsing human output", async 
       return true;
     },
   );
+});
+
+test("usage maps a missing Codex CLI to an unavailable provider row", async () => {
+  const opsail = createOpsail({ binaryPath });
+  const result = await opsail.usage({
+    provider: "codex",
+    codexPath: "/opsail-missing-codex/codex",
+  });
+
+  assert.equal(result.schemaVersion, 1);
+  assert.equal(result.providers[0].provider, "codex");
+  assert.equal(result.providers[0].status, "unavailable");
+  assert.match(result.providers[0].detail, /codex login/);
+  assert.equal(JSON.stringify(result).includes("secret"), false);
+});
+
+test("usage is exported from the package entry", async () => {
+  assert.equal(typeof usage, "function");
 });
 
 test("read honors a signal that is already aborted", async () => {

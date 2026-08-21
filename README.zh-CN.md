@@ -35,6 +35,10 @@ opsail read https://example.com/app --launch
 
 内容获取、正文提取、结果契约和 Rust API 请参阅 [`opsail-read`](https://github.com/lencx/opsail/blob/main/crates/opsail-read/README.md)；Chrome 发现、自有启动、借用 CDP、页面导航和渲染 DOM 捕获请参阅 [`opsail-chrome`](https://github.com/lencx/opsail/blob/main/crates/opsail-chrome/README.md)。
 
+### 查询用量
+
+`opsail usage` 查询当前支持的 CLI provider 剩余额度。目前支持 Codex 和 Grok；传入 provider 名称时只查询对应 provider。
+
 ### Codex Refit
 
 `opsail refit codex` 提供可逆且经过目标校验的 Codex 适配器。它的首个功能通过 renderer 已有的本地 bridge，在 Codex 左侧栏显示本地化的剩余额度信息，不调用模型，也不修改应用包。
@@ -60,6 +64,7 @@ opsail refit codex enable usage --launch
 | [`opsail`](https://crates.io/crates/opsail) | 原生 CLI 与统一命令入口 | 运行 `opsail --help` |
 | [`opsail-read`](https://crates.io/crates/opsail-read) | 内容获取、正文提取、清理和结果契约 | [README](https://github.com/lencx/opsail/blob/main/crates/opsail-read/README.md) |
 | [`opsail-chrome`](https://crates.io/crates/opsail-chrome) | 跨平台 Chrome 生命周期、CDP 传输和渲染捕获 | [README](https://github.com/lencx/opsail/blob/main/crates/opsail-chrome/README.md) |
+| [`opsail-usage`](https://crates.io/crates/opsail-usage) | CLI provider 剩余额度查询 | [README](https://github.com/lencx/opsail/blob/main/crates/opsail-usage/README.md) |
 | [`opsail-refit-codex`](https://crates.io/crates/opsail-refit-codex) | Codex 适配生命周期、额度语义、多语言和 UI payload | [README](https://github.com/lencx/opsail/blob/main/crates/opsail-refit-codex/README.md) |
 | Node.js [`opsail`](https://www.npmjs.com/package/opsail) | ESM API 与原生二进制分发 | [README](https://github.com/lencx/opsail/blob/main/packages/node/README.md) |
 

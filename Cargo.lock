@@ -1348,7 +1348,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "opsail"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -1357,6 +1357,7 @@ dependencies = [
  "miette",
  "opsail-read",
  "opsail-refit-codex",
+ "opsail-usage",
  "predicates",
  "serde",
  "serde_json",
@@ -1426,6 +1427,22 @@ dependencies = [
  "tracing",
  "url",
  "windows",
+]
+
+[[package]]
+name = "opsail-usage"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "process-wrap",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "wiremock",
 ]
 
 [[package]]

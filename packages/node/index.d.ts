@@ -97,6 +97,35 @@ export interface ReadResult {
   warnings: string[];
 }
 
+export interface UsageRequest {
+  /** Provider to query. When omitted, query every supported provider. */
+  provider?: "codex" | "grok";
+  /** Explicit Codex CLI executable path. */
+  codexPath?: string;
+  /** Explicit Grok CLI auth.json path. */
+  grokAuth?: string;
+  /** Native query deadline in milliseconds. */
+  timeoutMs?: number;
+}
+
+export interface UsageProviderResult {
+  provider: "codex" | "grok";
+  status: "ready" | "unavailable";
+  remainingPercent?: number;
+  usedPercent?: number;
+  resetsAt?: number;
+  windowDurationMins?: number;
+  planType?: string;
+  resetCreditAvailableCount?: number;
+  resetCreditExpiresAt?: number;
+  detail?: string;
+}
+
+export interface UsageResult {
+  schemaVersion: 1;
+  providers: UsageProviderResult[];
+}
+
 export interface CallOptions {
   signal?: AbortSignal;
 }
@@ -110,6 +139,7 @@ export interface OpsailConfig {
 
 export interface OpsailClient {
   read(request: ReadRequest, options?: CallOptions): Promise<ReadResult>;
+  usage(request?: UsageRequest, options?: CallOptions): Promise<UsageResult>;
 }
 
 export class OpsailError extends Error {
@@ -124,6 +154,11 @@ export function read(
   request: ReadRequest,
   options?: CallOptions,
 ): Promise<ReadResult>;
+
+export function usage(
+  request?: UsageRequest,
+  options?: CallOptions,
+): Promise<UsageResult>;
 
 export function createOpsail(config?: OpsailConfig): OpsailClient;
 

@@ -9,6 +9,7 @@ on:
       - "Cargo.toml"
       - "crates/opsail/**"
       - "crates/opsail-refit-codex/**"
+      - "crates/opsail-usage/**"
   push:
     branches:
       - main
@@ -19,6 +20,7 @@ on:
       - "Cargo.toml"
       - "crates/opsail/**"
       - "crates/opsail-refit-codex/**"
+      - "crates/opsail-usage/**"
   workflow_dispatch:
 
 permissions:
@@ -63,11 +65,11 @@ jobs:
           rustup default "$rust_version"
           rustup component add clippy
 
-      - name: Test refit and CLI
-        run: cargo test --locked --package opsail-refit-codex --package opsail
+      - name: Test refit, usage, and CLI
+        run: cargo test --locked --package opsail-refit-codex --package opsail-usage --package opsail
 
-      - name: Lint refit and CLI
-        run: cargo clippy --locked --package opsail-refit-codex --package opsail --all-targets --all-features -- -D warnings
+      - name: Lint refit, usage, and CLI
+        run: cargo clippy --locked --package opsail-refit-codex --package opsail-usage --package opsail --all-targets --all-features -- -D warnings
 
       - name: Build native CLI
         run: cargo build --locked --package opsail

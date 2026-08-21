@@ -19,7 +19,7 @@ platform packages remain implementation details and have no separate API or
 command.
 
 ```js
-import { read } from "opsail";
+import { read, usage } from "opsail";
 
 const result = await read({
   source: {
@@ -106,6 +106,17 @@ require live computed visibility and stability evidence bound to the same root
 frame, loader, and final URL. Missing or inconsistent rendered evidence stays
 unclassified. Coverage is conservative, not exhaustive; Opsail reports the gate
 but does not solve or bypass it.
+
+`usage()` is the Node equivalent of `opsail usage`. It queries supported CLI
+providers without attaching to ChatGPT.app. Codex and Grok are currently
+supported. Omit `provider` to query all current providers:
+
+```js
+const report = await usage();
+```
+
+Pass `codexPath` for an explicit Codex executable. Resolution is `codexPath`,
+then `OPSAIL_CODEX_PATH` inherited by the native process, then `PATH`.
 
 Applications that package the native binary themselves, including Electron
 applications, can override automatic resolution with an absolute path:

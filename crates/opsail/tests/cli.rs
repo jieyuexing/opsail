@@ -830,3 +830,197 @@ fn cdp_direct_conflicts_with_target_selection() {
             "the argument '--cdp-direct' cannot be used with '--target-id <ID>'",
         ));
 }
+
+#[test]
+fn usage_help_describes_supported_providers() {
+    let mut command = cargo_bin_cmd!("opsail");
+    command.args(["usage", "--help"]).assert().success().stdout(
+        predicate::str::contains("codex")
+            .and(predicate::str::contains("grok"))
+            .and(predicate::str::contains("codex app-server"))
+            .and(predicate::str::contains("--codex-path"))
+            .and(predicate::str::contains("--grok-auth"))
+            .and(predicate::str::contains("does not attach to ChatGPT.app")),
+    );
+}
+
+#[test]
+fn usage_unknown_provider_is_a_clap_usage_error() {
+    let mut command = cargo_bin_cmd!("opsail");
+    command
+        .args(["usage", "claude"])
+        .assert()
+        .code(2)
+        .stdout("")
+        .stderr(predicate::str::contains("invalid value 'claude'"));
+}
+
+#[test]
+fn usage_codex_missing_binary_is_an_unavailable_row() {
+    let mut command = cargo_bin_cmd!("opsail");
+    let assert = command
+        .args([
+            "usage",
+            "codex",
+            "--codex-path",
+            "/opsail-missing-codex/codex",
+        ])
+        .assert()
+        .success()
+        .stderr("");
+    let value: serde_json::Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
+    assert_eq!(value["schemaVersion"], 1);
+    assert_eq!(value["providers"][0]["provider"], "codex");
+    assert_eq!(value["providers"][0]["status"], "unavailable");
+    assert!(
+        value["providers"][0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("`codex login`")
+    );
+}
+
+#[test]
+fn usage_without_provider_returns_every_supported_runtime() {
+    let mut command = cargo_bin_cmd!("opsail");
+    let assert = command
+        .args([
+            "usage",
+            "--codex-path",
+            "/opsail-missing-codex/codex",
+            "--grok-auth",
+            "/opsail-missing-grok/auth.json",
+        ])
+        .assert()
+        .success()
+        .stderr("");
+    let value: serde_json::Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
+    assert_eq!(value["schemaVersion"], 1);
+    assert_eq!(value["providers"][0]["provider"], "codex");
+    assert_eq!(value["providers"][1]["provider"], "grok");
+    assert_eq!(value["providers"][0]["status"], "unavailable");
+    assert_eq!(value["providers"][1]["status"], "unavailable");
+    assert_eq!(value["providers"].as_array().unwrap().len(), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn usage_reads_rate_limits_from_a_fake_codex_cli() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempdir().unwrap();
+    let fake = directory.path().join("codex");
+    fs::write(
+        &fake,
+        r#"#!/usr/bin/env python3
+import json, sys
+
+def read_frame():
+    line = sys.stdin.readline()
+    if not line:
+        raise SystemExit(0)
+    return json.loads(line)
+
+def write_frame(frame):
+    sys.stdout.write(json.dumps(frame) + "\n")
+    sys.stdout.flush()
+
+initialize = read_frame()
+write_frame({"id": initialize["id"], "result": {}})
+initialized = read_frame()
+assert initialized["method"] == "initialized"
+request = read_frame()
+assert request["method"] == "account/rateLimits/read"
+write_frame({
+    "id": request["id"],
+    "result": {
+        "rateLimits": {
+            "primary": {"usedPercent": 25, "resetsAt": 1786000000, "windowDurationMins": 300}
+        },
+        "rateLimitsByLimitId": {
+            "codex": {
+                "primary": {"usedPercent": 25, "resetsAt": 1786000000, "windowDurationMins": 300},
+                "planType": "plus"
+            }
+        }
+    }
+})
+"#,
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&fake).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake, permissions).unwrap();
+
+    let mut command = cargo_bin_cmd!("opsail");
+    let assert = command
+        .args(["usage", "codex", "--codex-path"])
+        .arg(&fake)
+        .assert()
+        .success()
+        .stderr("");
+    let value: serde_json::Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
+    assert_eq!(value["schemaVersion"], 1);
+    assert_eq!(value["providers"][0]["provider"], "codex");
+    assert_eq!(value["providers"][0]["status"], "ready");
+    assert_eq!(value["providers"][0]["remainingPercent"], 75);
+    assert_eq!(value["providers"][0]["usedPercent"].as_f64(), Some(25.0));
+    assert_eq!(value["providers"][0]["planType"], "plus");
+}
+
+#[cfg(windows)]
+#[test]
+fn usage_reads_rate_limits_through_a_windows_command_shim() {
+    let directory = tempdir().unwrap();
+    let script = directory.path().join("fake-codex.ps1");
+    fs::write(
+        &script,
+        r#"$initialize = [Console]::In.ReadLine() | ConvertFrom-Json
+[Console]::Out.WriteLine((@{ id = $initialize.id; result = @{} } | ConvertTo-Json -Compress))
+$initialized = [Console]::In.ReadLine() | ConvertFrom-Json
+if ($initialized.method -ne "initialized") { exit 2 }
+$request = [Console]::In.ReadLine() | ConvertFrom-Json
+if ($request.method -ne "account/rateLimits/read") { exit 3 }
+$result = @{
+  id = $request.id
+  result = @{
+    rateLimits = @{
+      primary = @{ usedPercent = 25; resetsAt = 1786000000; windowDurationMins = 300 }
+    }
+    rateLimitsByLimitId = @{
+      codex = @{
+        primary = @{ usedPercent = 25; resetsAt = 1786000000; windowDurationMins = 300 }
+        planType = "plus"
+      }
+    }
+  }
+}
+[Console]::Out.WriteLine(($result | ConvertTo-Json -Depth 8 -Compress))
+"#,
+    )
+    .unwrap();
+    let shim = directory.path().join("codex.cmd");
+    fs::write(
+        &shim,
+        format!(
+            "@echo off\r\npowershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{}\"\r\n",
+            script.display()
+        ),
+    )
+    .unwrap();
+
+    let mut command = cargo_bin_cmd!("opsail");
+    let assert = command
+        .args(["usage", "codex", "--codex-path"])
+        .arg(&shim)
+        .assert()
+        .success()
+        .stderr("");
+    let value: serde_json::Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
+    assert_eq!(value["schemaVersion"], 1);
+    assert_eq!(value["providers"][0]["provider"], "codex");
+    assert_eq!(value["providers"][0]["status"], "ready");
+    assert_eq!(value["providers"][0]["remainingPercent"], 75);
+    assert_eq!(value["providers"][0]["usedPercent"].as_f64(), Some(25.0));
+    assert_eq!(value["providers"][0]["planType"], "plus");
+}

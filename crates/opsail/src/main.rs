@@ -15,6 +15,7 @@ use url::Url;
 mod activity;
 mod codex;
 mod machine;
+mod usage;
 
 const PROPERTY_NAMES: &str = "content, markdown, contentHtml, html, title, author, description, site, published, modified, image, favicon, language, direction, url, canonicalUrl, domain, wordCount, quality, source, extraction";
 
@@ -41,6 +42,8 @@ enum Command {
     /// Read a URL or HTML input and extract its primary content.
     #[command(visible_alias = "extract")]
     Read(Box<ReadArgs>),
+    /// Read remaining Codex and Grok CLI rate-limit windows.
+    Usage(usage::UsageArgs),
     /// Apply a reversible, target-validated application refit.
     Refit(RefitArgs),
 }
@@ -235,7 +238,7 @@ fn init_tracing(verbosity: u8) {
         _ => "trace",
     };
     let filter = EnvFilter::new(format!(
-        "error,opsail={level},opsail_read={level},opsail_chrome={level},opsail_refit_codex={level}"
+        "error,opsail={level},opsail_read={level},opsail_chrome={level},opsail_refit_codex={level},opsail_usage={level}"
     ));
 
     tracing_subscriber::fmt()
@@ -286,7 +289,7 @@ async fn shutdown_signal() {
     std::future::pending::<()>().await;
 }
 
-fn parse_positive_u64(value: &str) -> std::result::Result<u64, String> {
+pub(crate) fn parse_positive_u64(value: &str) -> std::result::Result<u64, String> {
     value
         .parse::<u64>()
         .map_err(|error| error.to_string())
@@ -311,6 +314,7 @@ fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
 async fn run(command: Command) -> Result<()> {
     match command {
         Command::Read(args) => run_read(*args).await,
+        Command::Usage(args) => usage::run(args).await,
         Command::Refit(args) => run_refit(args).await,
     }
 }
@@ -538,7 +542,7 @@ fn render_property(value: Value, format: OutputFormat) -> Result<String> {
     }
 }
 
-fn with_trailing_newline(mut value: String) -> String {
+pub(crate) fn with_trailing_newline(mut value: String) -> String {
     if !value.ends_with('\n') {
         value.push('\n');
     }
@@ -556,7 +560,7 @@ async fn write_output(path: Option<&Path>, data: &[u8]) -> Result<()> {
     }
 }
 
-fn write_stdout(data: &[u8]) -> Result<()> {
+pub(crate) fn write_stdout(data: &[u8]) -> Result<()> {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
     finish_stdout_write((|| {

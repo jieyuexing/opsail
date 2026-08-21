@@ -66,6 +66,15 @@ export function createOpsail(config = {}) {
         maxOutputBytes,
       );
     },
+    usage(request = {}, callOptions = {}) {
+      return usageWithConfig(
+        request,
+        callOptions,
+        config.binaryPath,
+        configuredHardTimeoutMs,
+        maxOutputBytes,
+      );
+    },
   });
 }
 
@@ -126,6 +135,85 @@ async function readWithConfig(
   });
 }
 
+async function usageWithConfig(
+  request,
+  callOptions,
+  configuredBinaryPath,
+  configuredHardTimeoutMs,
+  maxOutputBytes,
+) {
+  if (request === undefined) {
+    request = {};
+  }
+  if (!isRecord(request)) {
+    throw new TypeError("usage request must be an object");
+  }
+  if (!isRecord(callOptions)) {
+    throw new TypeError("usage call options must be an object");
+  }
+  const { signal } = callOptions;
+  if (signal !== undefined && !isAbortSignal(signal)) {
+    throw new TypeError("signal must be an AbortSignal");
+  }
+  if (signal?.aborted) {
+    throw abortedUsageError();
+  }
+
+  const argv = ["usage", "--format", "json"];
+  if (request.codexPath !== undefined) {
+    if (typeof request.codexPath !== "string" || request.codexPath.length === 0) {
+      throw new OpsailError("usage request.codexPath must be a non-empty string", {
+        code: "invalid-request",
+        stage: "input",
+      });
+    }
+    argv.push("--codex-path", request.codexPath);
+  }
+  if (request.grokAuth !== undefined) {
+    if (typeof request.grokAuth !== "string" || request.grokAuth.length === 0) {
+      throw new OpsailError("usage request.grokAuth must be a non-empty string", {
+        code: "invalid-request",
+        stage: "input",
+      });
+    }
+    argv.push("--grok-auth", request.grokAuth);
+  }
+  if (request.timeoutMs !== undefined) {
+    if (!Number.isSafeInteger(request.timeoutMs) || request.timeoutMs <= 0) {
+      throw new TypeError("timeoutMs must be a positive safe integer");
+    }
+    argv.push("--timeout", String(Math.max(1, Math.ceil(request.timeoutMs / 1000))));
+  }
+  if (request.provider !== undefined) {
+    if (request.provider !== "codex" && request.provider !== "grok") {
+      throw new OpsailError("usage request.provider must be codex or grok", {
+        code: "invalid-request",
+        stage: "input",
+      });
+    }
+    argv.push(request.provider);
+  }
+
+  const binaryPath = opsailPath({ binaryPath: configuredBinaryPath });
+  const hardTimeoutMs = resolveHardTimeoutMs(
+    configuredHardTimeoutMs,
+    request.timeoutMs,
+  );
+  if (signal?.aborted) {
+    throw abortedUsageError();
+  }
+
+  return invokeArgv({
+    binaryPath,
+    argv,
+    signal,
+    hardTimeoutMs,
+    maxOutputBytes,
+    parse: parseUsageResponse,
+    aborted: abortedUsageError,
+  });
+}
+
 export function resolveHardTimeoutMs(
   configuredHardTimeoutMs,
   requestTimeoutMs,
@@ -148,6 +236,50 @@ function invokeMachine({
   maxOutputBytes,
   ownsChrome,
 }) {
+  return invokeProcess({
+    binaryPath,
+    argv: ["read", "--machine"],
+    stdin: body,
+    signal,
+    hardTimeoutMs,
+    maxOutputBytes,
+    ownsChrome,
+    parse: parseMachineResponse,
+    aborted: abortedError,
+  });
+}
+
+function invokeArgv({
+  binaryPath,
+  argv,
+  signal,
+  hardTimeoutMs,
+  maxOutputBytes,
+  parse,
+  aborted,
+}) {
+  return invokeProcess({
+    binaryPath,
+    argv,
+    signal,
+    hardTimeoutMs,
+    maxOutputBytes,
+    parse,
+    aborted,
+  });
+}
+
+function invokeProcess({
+  binaryPath,
+  argv,
+  stdin,
+  signal,
+  hardTimeoutMs,
+  maxOutputBytes,
+  ownsChrome,
+  parse,
+  aborted,
+}) {
   return new Promise((resolve, reject) => {
     let chromeTempRoot;
     try {
@@ -163,7 +295,7 @@ function invokeMachine({
 
     let child;
     try {
-      child = spawn(binaryPath, ["read", "--machine"], {
+      child = spawn(binaryPath, argv, {
         detached: process.platform !== "win32",
         env:
           chromeTempRoot === undefined
@@ -269,7 +401,7 @@ function invokeMachine({
     hardTimeout.unref?.();
 
     const onAbort = () => {
-      requestTermination(abortedError);
+      requestTermination(aborted);
     };
     signal?.addEventListener("abort", onAbort, { once: true });
     if (signal?.aborted) {
@@ -348,7 +480,7 @@ function invokeMachine({
       }
 
       try {
-        const result = parseMachineResponse(
+        const result = parse(
           Buffer.concat(stdout),
           code,
           signalCode,
@@ -360,8 +492,8 @@ function invokeMachine({
       }
     });
 
-    if (terminalError === undefined) {
-      child.stdin.end(body);
+    if (terminalError === undefined && stdin !== undefined) {
+      child.stdin.end(stdin);
     } else {
       child.stdin.end();
     }
@@ -480,6 +612,94 @@ function abortedError() {
     code: "aborted",
     stage: "process",
   });
+}
+
+function abortedUsageError() {
+  return new OpsailError("Opsail usage was aborted", {
+    code: "aborted",
+    stage: "process",
+  });
+}
+
+export function parseUsageResponse(stdout, exitCode, signalCode, stderr) {
+  const diagnostic = diagnosticOption(stderr);
+  const text = stdout.toString("utf8").trim();
+  if (exitCode !== 0 || signalCode !== null) {
+    const source = `${text}\n${diagnostic.diagnostic ?? ""}`;
+    const codeMatch = source.match(/\[opsail-usage:([a-z-]+)\]/);
+    throw new OpsailError(
+      signalCode === null
+        ? `Opsail usage exited with code ${exitCode ?? "unknown"}`
+        : `Opsail usage exited from signal ${signalCode}`,
+      {
+        code: codeMatch?.[1] ?? "usage-failed",
+        stage: "process",
+        retryable: codeMatch?.[1] === "timed-out",
+        ...diagnostic,
+      },
+    );
+  }
+  if (text.length === 0) {
+    throw new OpsailError("Opsail usage returned no response", {
+      code: "invalid-response",
+      stage: "protocol",
+      ...diagnostic,
+    });
+  }
+  let result;
+  try {
+    result = JSON.parse(text);
+  } catch (cause) {
+    throw new OpsailError("Opsail usage returned invalid JSON", {
+      code: "invalid-response",
+      stage: "protocol",
+      cause,
+      ...diagnostic,
+    });
+  }
+  if (!isUsageResult(result)) {
+    throw new OpsailError("Opsail usage returned an invalid snapshot", {
+      code: "invalid-response",
+      stage: "protocol",
+      ...diagnostic,
+    });
+  }
+  return result;
+}
+
+function isUsageResult(value) {
+  return (
+    isRecord(value) &&
+    value.schemaVersion === 1 &&
+    Array.isArray(value.providers) &&
+    value.providers.every(isUsageEntry)
+  );
+}
+
+function isUsageEntry(value) {
+  if (!isRecord(value) || (value.provider !== "codex" && value.provider !== "grok")) {
+    return false;
+  }
+  if (value.status === "unavailable") {
+    return typeof value.detail === "string" && value.detail.length > 0;
+  }
+  return (
+    value.status === "ready" &&
+    Number.isSafeInteger(value.remainingPercent) &&
+    value.remainingPercent >= 0 &&
+    value.remainingPercent <= 100 &&
+    Number.isFinite(value.usedPercent) &&
+    value.usedPercent >= 0 &&
+    value.usedPercent <= 100 &&
+    (value.resetsAt === undefined || isNonNegativeSafeInteger(value.resetsAt)) &&
+    (value.windowDurationMins === undefined ||
+      (Number.isFinite(value.windowDurationMins) && value.windowDurationMins > 0)) &&
+    isOptionalString(value.planType) &&
+    (value.resetCreditAvailableCount === undefined ||
+      isNonNegativeSafeInteger(value.resetCreditAvailableCount)) &&
+    (value.resetCreditExpiresAt === undefined ||
+      isNonNegativeSafeInteger(value.resetCreditExpiresAt))
+  );
 }
 
 function positiveInteger(value, fallback, name) {

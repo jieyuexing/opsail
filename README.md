@@ -35,6 +35,10 @@ opsail read https://example.com/app --launch
 
 See [`opsail-read`](https://github.com/lencx/opsail/blob/main/crates/opsail-read/README.md) for acquisition, extraction, result contracts, and Rust APIs. See [`opsail-chrome`](https://github.com/lencx/opsail/blob/main/crates/opsail-chrome/README.md) for Chrome discovery, owned launch, borrowed CDP, navigation, and rendered DOM capture.
 
+### Query remaining usage
+
+`opsail usage` reports remaining windows from supported CLI providers. Codex and Grok are currently supported. Pass a provider name to query only that provider.
+
 ### Refit Codex
 
 `opsail refit codex` provides a reversible, target-validated Codex adapter. Its first feature adds localized remaining-usage information to the Codex sidebar using the renderer's existing local bridge, without model calls or changes to the application bundle.
@@ -60,6 +64,7 @@ See [`opsail-refit-codex`](https://github.com/lencx/opsail/blob/main/crates/opsa
 | [`opsail`](https://crates.io/crates/opsail) | Native CLI and unified command entry point | Run `opsail --help` |
 | [`opsail-read`](https://crates.io/crates/opsail-read) | Content acquisition, extraction, sanitization, and result contracts | [README](https://github.com/lencx/opsail/blob/main/crates/opsail-read/README.md) |
 | [`opsail-chrome`](https://crates.io/crates/opsail-chrome) | Cross-platform Chrome lifecycle, CDP transport, and rendered capture | [README](https://github.com/lencx/opsail/blob/main/crates/opsail-chrome/README.md) |
+| [`opsail-usage`](https://crates.io/crates/opsail-usage) | Remaining-usage queries for supported CLI providers | [README](https://github.com/lencx/opsail/blob/main/crates/opsail-usage/README.md) |
 | [`opsail-refit-codex`](https://crates.io/crates/opsail-refit-codex) | Validated Codex refit lifecycle, usage semantics, localization, and UI payload | [README](https://github.com/lencx/opsail/blob/main/crates/opsail-refit-codex/README.md) |
 | [`opsail`](https://www.npmjs.com/package/opsail) for Node.js | ESM API and native binary distribution | [README](https://github.com/lencx/opsail/blob/main/packages/node/README.md) |
 
