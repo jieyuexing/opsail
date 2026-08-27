@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use miette::{IntoDiagnostic, Result, WrapErr, miette};
-use opsail_read::{CdpSource, CdpWaitUntil, ChromeSource, Input, ReadOptions, ReadResult, read};
+use opsail_read::{
+    CdpSource, CdpWaitUntil, ChromeSource, Input, ReadArtifact, ReadOptions, read_artifact,
+};
 use serde_json::Value;
 use tokio::io::AsyncReadExt;
 use tracing_subscriber::{EnvFilter, util::SubscriberInitExt};
@@ -16,7 +18,7 @@ mod activity;
 mod codex;
 mod machine;
 
-const PROPERTY_NAMES: &str = "content, markdown, contentHtml, html, title, author, description, site, published, modified, image, favicon, language, direction, url, canonicalUrl, domain, wordCount, quality, source, extraction";
+const PROPERTY_NAMES: &str = "content, markdown, contentHtml, html, title, author, description, site, published, modified, image, favicon, language, direction, url, canonicalUrl, domain, wordCount, quality, source, extraction, revision, workbook, sheets, selections, definedNames, features, statistics, metrics";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -38,7 +40,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Read a URL or HTML input and extract its primary content.
+    /// Read a URL, HTML input, or XLSX workbook.
     #[command(visible_alias = "extract")]
     Read(Box<ReadArgs>),
     /// Apply a reversible, target-validated application refit.
@@ -79,12 +81,18 @@ struct ReadArgs {
             "chrome_path",
             "target_id",
             "cdp_direct",
-            "wait_until"
+            "wait_until",
+            "ranges",
+            "max_cells",
+            "max_expanded_bytes",
+            "max_output_bytes",
+            "no_formulas",
+            "revision_only"
         ]
     )]
     machine: bool,
 
-    /// URL, HTML file, or '-' for stdin. Browser modes accept an HTTP(S) URL.
+    /// URL, HTML/XLSX file, or '-' for HTML stdin. Browser modes accept an HTTP(S) URL.
     #[arg(value_name = "SOURCE")]
     source: Option<PathBuf>,
 
@@ -97,7 +105,8 @@ struct ReadArgs {
         "content", "markdown", "contentHtml", "html", "title", "author",
         "description", "site", "published", "modified", "image", "favicon",
         "language", "direction", "url", "canonicalUrl", "domain", "wordCount",
-        "quality", "source", "extraction"
+        "quality", "source", "extraction", "workbook", "sheets", "selections",
+        "definedNames", "revision", "features", "statistics", "metrics"
     ])]
     property: Option<String>,
 
@@ -149,6 +158,39 @@ struct ReadArgs {
     /// Maximum number of input bytes to read.
     #[arg(long, value_name = "BYTES", value_parser = parse_positive_usize)]
     max_bytes: Option<usize>,
+
+    /// XLSX range in Sheet!A1:D20 form. Repeat to batch multiple ranges.
+    #[arg(
+        long = "range",
+        value_name = "SHEET!A1:D20",
+        action = ArgAction::Append,
+        conflicts_with_all = ["cdp", "launch", "chrome_path", "base_url"]
+    )]
+    ranges: Vec<String>,
+
+    /// Maximum number of non-empty XLSX cells returned across all ranges.
+    #[arg(long, value_name = "COUNT", value_parser = parse_positive_usize)]
+    max_cells: Option<usize>,
+
+    /// Maximum cumulative uncompressed OOXML bytes read from an XLSX package.
+    #[arg(long, value_name = "BYTES", value_parser = parse_positive_usize)]
+    max_expanded_bytes: Option<usize>,
+
+    /// Maximum serialized workbook bytes written to stdout or an output file.
+    /// Published cells are truncated in stable order to satisfy the bound.
+    #[arg(long, value_name = "BYTES", value_parser = parse_positive_usize)]
+    max_output_bytes: Option<usize>,
+
+    /// Omit XLSX formula expressions while preserving cached values.
+    #[arg(long, conflicts_with_all = ["cdp", "launch", "chrome_path"])]
+    no_formulas: bool,
+
+    /// Read only the XLSX central-directory revision and workbook manifest.
+    #[arg(
+        long,
+        conflicts_with_all = ["cdp", "launch", "chrome_path", "base_url", "ranges"]
+    )]
+    revision_only: bool,
 
     /// User-Agent used for HTTP requests or Chrome CDP navigation.
     #[arg(long, value_name = "VALUE")]
@@ -337,6 +379,12 @@ async fn run_read(args: ReadArgs) -> Result<()> {
         wait_until,
         timeout,
         max_bytes,
+        ranges,
+        max_cells,
+        max_expanded_bytes,
+        max_output_bytes,
+        no_formulas,
+        revision_only,
         user_agent,
         accept_language,
     } = args;
@@ -355,6 +403,15 @@ async fn run_read(args: ReadArgs) -> Result<()> {
     if let Some(max_bytes) = max_bytes {
         options.max_bytes = max_bytes;
     }
+    options.spreadsheet.ranges = ranges;
+    if let Some(max_cells) = max_cells {
+        options.spreadsheet.max_cells = max_cells;
+    }
+    if let Some(max_expanded_bytes) = max_expanded_bytes {
+        options.spreadsheet.max_expanded_bytes = max_expanded_bytes;
+    }
+    options.spreadsheet.include_formulas = !no_formulas;
+    options.spreadsheet.revision_only = revision_only;
     options.user_agent = user_agent;
     if let Some(accept_language) = accept_language {
         options.accept_language = Some(accept_language);
@@ -375,16 +432,15 @@ async fn run_read(args: ReadArgs) -> Result<()> {
         }
         (Some(_), true) => unreachable!("clap rejects --cdp with --launch"),
     };
-    let result = read(input, &options)
+    let mut result = read_artifact(input, &options)
         .await
         .into_diagnostic()
         .wrap_err("failed to read source")?;
 
-    for warning in &result.warnings {
+    let data = render_result_bounded(&mut result, format, property.as_deref(), max_output_bytes)?;
+    for warning in result.warnings() {
         tracing::warn!(warning = %warning, "read warning");
     }
-
-    let data = render_result(&result, format, property.as_deref())?;
     write_output(output.as_deref(), &data).await
 }
 
@@ -497,7 +553,7 @@ async fn read_stdin(max_bytes: usize) -> Result<Vec<u8>> {
 }
 
 fn render_result(
-    result: &ReadResult,
+    result: &ReadArtifact,
     format: OutputFormat,
     property: Option<&str>,
 ) -> Result<Vec<u8>> {
@@ -509,8 +565,8 @@ fn render_result(
             render_property(value, format)?
         }
         None => match format {
-            OutputFormat::Markdown => result.content.clone(),
-            OutputFormat::Html => result.content_html.clone(),
+            OutputFormat::Markdown => result.content().to_owned(),
+            OutputFormat::Html => result.content_html().to_owned(),
             OutputFormat::Json => serde_json::to_string_pretty(result)
                 .into_diagnostic()
                 .wrap_err("failed to serialize result")?,
@@ -518,6 +574,60 @@ fn render_result(
     };
 
     Ok(with_trailing_newline(rendered).into_bytes())
+}
+
+fn render_result_bounded(
+    result: &mut ReadArtifact,
+    format: OutputFormat,
+    property: Option<&str>,
+    max_output_bytes: Option<usize>,
+) -> Result<Vec<u8>> {
+    let mut rendered = render_result(result, format, property)?;
+    let Some(limit) = max_output_bytes else {
+        return Ok(rendered);
+    };
+    if rendered.len() <= limit {
+        return Ok(rendered);
+    }
+    if !matches!(result, ReadArtifact::Workbook(_)) {
+        return Err(miette!(
+            "rendered output is {} bytes, above --max-output-bytes {limit}",
+            rendered.len()
+        ));
+    }
+    let warning =
+        format!("spreadsheet output was truncated to fit the {limit} byte serialized-output limit");
+    let mut retained_cells = if let ReadArtifact::Workbook(workbook) = result {
+        if !workbook
+            .warnings
+            .iter()
+            .any(|existing| existing == &warning)
+        {
+            workbook.warnings.push(warning);
+        }
+        workbook
+            .workbook
+            .selections
+            .iter()
+            .map(|selection| selection.cells.len())
+            .sum::<usize>()
+    } else {
+        unreachable!("workbook variant checked above")
+    };
+    while rendered.len() > limit && retained_cells > 0 {
+        retained_cells /= 2;
+        if let ReadArtifact::Workbook(workbook) = result {
+            workbook.truncate_published_cells(retained_cells);
+        }
+        rendered = render_result(result, format, property)?;
+    }
+    if rendered.len() > limit {
+        return Err(miette!(
+            "workbook metadata alone is {} bytes, above --max-output-bytes {limit}",
+            rendered.len()
+        ));
+    }
+    Ok(rendered)
 }
 
 fn render_property(value: Value, format: OutputFormat) -> Result<String> {

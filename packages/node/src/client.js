@@ -413,7 +413,7 @@ export function parseMachineResponse(stdout, exitCode, signalCode, stderr) {
     });
   }
 
-  if (response.ok === true && isReadResult(response.result)) {
+  if (response.ok === true && isReadArtifact(response.result)) {
     if (exitCode !== 0 || signalCode !== null) {
       throw new OpsailError("Opsail success response disagrees with its exit code", {
         code: "protocol-mismatch",
@@ -520,6 +520,28 @@ function isEngineInfo(value) {
   );
 }
 
+function isReadArtifact(value) {
+  return isReadResult(value) || isWorkbookReadResult(value);
+}
+
+function isSourceInfo(value) {
+  return (
+    isRecord(value) &&
+    SOURCE_KINDS.has(value.kind) &&
+    typeof value.requested === "string" &&
+    OPTIONAL_SOURCE_STRINGS.every((field) => isOptionalString(value[field])) &&
+    typeof value.charset === "string" &&
+    isNonNegativeSafeInteger(value.bytes)
+  );
+}
+
+function hasStringWarnings(value) {
+  return (
+    Array.isArray(value) &&
+    value.every((warning) => typeof warning === "string")
+  );
+}
+
 function isReadResult(value) {
   return (
     isRecord(value) &&
@@ -531,14 +553,7 @@ function isReadResult(value) {
     OPTIONAL_METADATA_STRINGS.every((field) =>
       isOptionalString(value.metadata[field]),
     ) &&
-    isRecord(value.source) &&
-    SOURCE_KINDS.has(value.source.kind) &&
-    typeof value.source.requested === "string" &&
-    OPTIONAL_SOURCE_STRINGS.every((field) =>
-      isOptionalString(value.source[field]),
-    ) &&
-    typeof value.source.charset === "string" &&
-    isNonNegativeSafeInteger(value.source.bytes) &&
+    isSourceInfo(value.source) &&
     isRecord(value.extraction) &&
     EXTRACTION_METHODS.has(value.extraction.method) &&
     isNonNegativeSafeInteger(value.extraction.durationMs) &&
@@ -550,8 +565,228 @@ function isReadResult(value) {
     value.quality.extractionRatio >= 0 &&
     value.quality.extractionRatio <= 1 &&
     typeof value.quality.probablyReadable === "boolean" &&
-    Array.isArray(value.warnings) &&
-    value.warnings.every((warning) => typeof warning === "string")
+    hasStringWarnings(value.warnings)
+  );
+}
+
+function isWorkbookReadResult(value) {
+  return (
+    isRecord(value) &&
+    value.schemaVersion === 1 &&
+    value.artifactKind === "workbook" &&
+    typeof value.content === "string" &&
+    typeof value.contentHtml === "string" &&
+    isRecord(value.metadata) &&
+    typeof value.metadata.title === "string" &&
+    isSourceInfo(value.source) &&
+    isRecord(value.extraction) &&
+    value.extraction.method === "ooxml-sparse" &&
+    isNonNegativeSafeInteger(value.extraction.durationMs) &&
+    isNonNegativeSafeInteger(value.extraction.durationMicros) &&
+    isWorkbookRevision(value.revision) &&
+    isWorkbookInfo(value.workbook) &&
+    hasStringWarnings(value.warnings)
+  );
+}
+
+function isWorkbookInfo(value) {
+  return (
+    isRecord(value) &&
+    value.format === "xlsx" &&
+    (value.dateSystem === "excel1900" || value.dateSystem === "excel1904") &&
+    Array.isArray(value.sheets) &&
+    value.sheets.every(isWorkbookSheet) &&
+    Array.isArray(value.definedNames) &&
+    value.definedNames.every(isDefinedName) &&
+    Array.isArray(value.selections) &&
+    value.selections.every(isWorkbookSelection) &&
+    isWorkbookFeatureInventory(value.features) &&
+    isWorkbookStatistics(value.statistics)
+  );
+}
+
+function isWorkbookSheet(value) {
+  return (
+    isRecord(value) &&
+    isNonNegativeSafeInteger(value.index) &&
+    typeof value.name === "string" &&
+    typeof value.part === "string" &&
+    isWorkbookPartRevision(value.revision) &&
+    ["visible", "hidden", "very-hidden"].includes(value.state) &&
+    isOptionalString(value.declaredDimension) &&
+    isOptionalString(value.semanticBounds) &&
+    typeof value.semanticBoundsComplete === "boolean" &&
+    typeof value.selected === "boolean" &&
+    Array.isArray(value.mergedRanges) &&
+    value.mergedRanges.every((range) => typeof range === "string") &&
+    isNonNegativeSafeInteger(value.hiddenRows) &&
+    isNonNegativeSafeInteger(value.hiddenColumns) &&
+    isWorksheetFeatureInventory(value.features)
+  );
+}
+
+function isDefinedName(value) {
+  return (
+    isRecord(value) &&
+    typeof value.name === "string" &&
+    (value.localSheetIndex === undefined ||
+      isNonNegativeSafeInteger(value.localSheetIndex)) &&
+    typeof value.reference === "string" &&
+    typeof value.validReference === "boolean"
+  );
+}
+
+function isWorkbookSelection(value) {
+  return (
+    isRecord(value) &&
+    typeof value.requested === "string" &&
+    typeof value.sheet === "string" &&
+    typeof value.range === "string" &&
+    isSelectionBounds(value.bounds) &&
+    Array.isArray(value.cells) &&
+    value.cells.every(isWorkbookCell) &&
+    typeof value.truncated === "boolean"
+  );
+}
+
+function isSelectionBounds(value) {
+  return (
+    isRecord(value) &&
+    Number.isSafeInteger(value.startRow) &&
+    value.startRow > 0 &&
+    Number.isSafeInteger(value.startColumn) &&
+    value.startColumn > 0 &&
+    Number.isSafeInteger(value.endRow) &&
+    value.endRow >= value.startRow &&
+    Number.isSafeInteger(value.endColumn) &&
+    value.endColumn >= value.startColumn
+  );
+}
+
+function isWorkbookCell(value) {
+  return (
+    isRecord(value) &&
+    typeof value.reference === "string" &&
+    Number.isSafeInteger(value.row) &&
+    value.row > 0 &&
+    Number.isSafeInteger(value.column) &&
+    value.column > 0 &&
+    ["string", "number", "boolean", "error", "date", "blank"].includes(
+      value.valueType,
+    ) &&
+    typeof value.value === "string" &&
+    typeof value.display === "string" &&
+    isOptionalString(value.formula) &&
+    (value.formulaKind === undefined ||
+      ["normal", "shared", "array", "data-table", "other"].includes(
+        value.formulaKind,
+      )) &&
+    isOptionalString(value.formulaReference) &&
+    (value.sharedFormulaIndex === undefined ||
+      isNonNegativeSafeInteger(value.sharedFormulaIndex)) &&
+    typeof value.richText === "boolean" &&
+    (value.styleIndex === undefined ||
+      isNonNegativeSafeInteger(value.styleIndex)) &&
+    isOptionalString(value.numberFormat)
+  );
+}
+
+function isWorkbookRevision(value) {
+  return (
+    isRecord(value) &&
+    /^fnv1a64-[0-9a-f]{16}$/.test(value.id) &&
+    isNonNegativeSafeInteger(value.compressedBytes) &&
+    isNonNegativeSafeInteger(value.expandedBytes) &&
+    Array.isArray(value.parts) &&
+    value.parts.every(isWorkbookPartRevision)
+  );
+}
+
+function isWorkbookPartRevision(value) {
+  return (
+    isRecord(value) &&
+    typeof value.name === "string" &&
+    /^[0-9a-f]{8}$/.test(value.crc32) &&
+    isNonNegativeSafeInteger(value.compressedBytes) &&
+    isNonNegativeSafeInteger(value.expandedBytes)
+  );
+}
+
+function isWorkbookFeatureInventory(value) {
+  return (
+    isRecord(value) &&
+    typeof value.inventoryComplete === "boolean" &&
+    [
+      "cellFormats",
+      "customNumberFormats",
+      "richStringItems",
+      "themeParts",
+      "drawingParts",
+      "chartParts",
+      "imageParts",
+      "tableParts",
+      "commentParts",
+      "controlPropertyParts",
+      "macroProjectParts",
+    ].every((field) => isNonNegativeSafeInteger(value[field]))
+  );
+}
+
+function isWorksheetFeatureInventory(value) {
+  return (
+    isRecord(value) &&
+    typeof value.scanned === "boolean" &&
+    typeof value.complete === "boolean" &&
+    typeof value.featureReferencesTruncated === "boolean" &&
+    [
+      "formulaCells",
+      "tableParts",
+      "drawingParts",
+      "commentDrawingParts",
+      "conditionalFormatRules",
+      "dataValidationRules",
+      "outlinedRows",
+      "outlinedColumns",
+      "maxRowOutlineLevel",
+      "maxColumnOutlineLevel",
+      "sparklines",
+      "controls",
+    ].every((field) => isNonNegativeSafeInteger(value[field])) &&
+    Array.isArray(value.hyperlinks) &&
+    value.hyperlinks.every(isWorkbookHyperlink) &&
+    isOptionalString(value.autoFilter) &&
+    Array.isArray(value.conditionalFormatRanges) &&
+    value.conditionalFormatRanges.every((range) => typeof range === "string") &&
+    Array.isArray(value.dataValidationRanges) &&
+    value.dataValidationRanges.every((range) => typeof range === "string") &&
+    typeof value.pageSetup === "boolean" &&
+    typeof value.headerFooter === "boolean"
+  );
+}
+
+function isWorkbookHyperlink(value) {
+  return (
+    isRecord(value) &&
+    typeof value.reference === "string" &&
+    isOptionalString(value.target) &&
+    isOptionalString(value.location) &&
+    isOptionalString(value.display) &&
+    typeof value.external === "boolean"
+  );
+}
+
+function isWorkbookStatistics(value) {
+  return (
+    isRecord(value) &&
+    [
+      "archiveEntries",
+      "expandedBytesRead",
+      "scannedSheets",
+      "cellElements",
+      "nonEmptyCells",
+      "styleOnlyCells",
+      "returnedCells",
+    ].every((field) => isNonNegativeSafeInteger(value[field]))
   );
 }
 

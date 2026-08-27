@@ -1,6 +1,6 @@
 ---
 name: opsail
-description: Use the Opsail native CLI for reliable agent capabilities, including readable-content extraction and the target-validated Codex sidebar usage refit.
+description: Use the Opsail native CLI for readable HTML extraction, sparse local XLSX range reading, and the target-validated Codex sidebar usage refit.
 license: Apache-2.0
 compatibility: Requires Opsail 0.2.0 and terminal execution.
 metadata: {"author":"Opsail contributors","version":"0.2.0","homepage":"https://github.com/lencx/opsail","openclaw":{"emoji":"⛵","homepage":"https://github.com/lencx/opsail","requires":{"bins":["opsail"]},"install":[{"id":"node","kind":"node","package":"opsail@0.2.0","bins":["opsail"],"label":"Install Opsail (npm)"}]},"hermes":{"tags":["opsail","native-tools","content-extraction","markdown","agents"]}}
@@ -8,7 +8,7 @@ metadata: {"author":"Opsail contributors","version":"0.2.0","homepage":"https://
 
 # Opsail
 
-Use the `opsail` native CLI for capabilities exposed through its unified command entry point. `read` extracts readable content from static HTML or a DOM rendered by an isolated or caller-managed Chrome. `refit codex` manages a reversible, target-validated usage display in the Codex sidebar. If the binary is missing or not version `0.2.0`, ask the user to provide and authorize `https://raw.githubusercontent.com/lencx/opsail/refs/heads/main/skills/bootstrap-opsail/SKILL.md`; do not install it implicitly from this Skill.
+Use the `opsail` native CLI for capabilities exposed through its unified command entry point. `read` extracts readable content from static HTML or a DOM rendered by an isolated or caller-managed Chrome, and reads bounded local XLSX ranges through a sparse OOXML path. `refit codex` manages a reversible, target-validated usage display in the Codex sidebar. If the binary is missing or not version `0.2.0`, ask the user to provide and authorize `https://raw.githubusercontent.com/lencx/opsail/refs/heads/main/skills/bootstrap-opsail/SKILL.md`; do not install it implicitly from this Skill.
 
 ## Read: choose the source
 
@@ -37,6 +37,53 @@ Get-Content -Raw '.\article.html' | opsail read -
 ```
 
 Prefer an argument array when invoking Opsail from code. Quote shell URLs and paths, and pass untrusted or large HTML through a file or stdin rather than interpolating it into a command.
+
+## Read: select XLSX ranges
+
+Read a local `.xlsx` workbook as a bounded sparse artifact. Structured JSON preserves sheet
+visibility, declared dimensions, semantic bounds, defined names, formulas and cached values,
+merged ranges, selected cells, truncation, and scan statistics:
+
+```sh
+opsail read './book.xlsx' --format json
+```
+
+With no `--range`, Opsail previews a bounded rectangle from each visible sheet. Hidden sheets
+remain in the manifest but are not previewed. When the task names one or more regions, repeat
+`--range` in a single invocation so the ZIP package, shared strings, and styles are opened once
+and each selected worksheet is scanned once:
+
+```sh
+opsail read './book.xlsx' \
+  --range 'Summary!A1:H30' \
+  --range "'API Sheet'!B6:AY40" \
+  --max-cells 10000 \
+  --format json
+```
+
+`--max-expanded-bytes` limits cumulative uncompressed OOXML bytes. `--no-formulas` omits formula
+expressions but preserves cached values. Formula values are never recalculated and may be stale.
+Treat `declaredDimension`, `semanticBounds`, `styleOnlyCells`, `truncated`, invalid defined names,
+and warnings as separate evidence.
+
+For a repeated read, probe the content revision before rereading cell XML:
+
+```sh
+opsail read './book.xlsx' --revision-only --property revision --format json
+```
+
+Reuse an existing Markdown mirror when the revision is unchanged. When a worksheet part changed,
+reread the previously selected ranges in one invocation and replace only matching
+`opsail:xlsx-generated` blocks; keep agent-authored text outside those blocks. Workbook,
+shared-string, style, or theme changes are dependency-wide and require a conservative full read.
+The CLI invocation itself is stateless; the high-efficiency `WorkbookSession` cache is an
+in-process `opsail-read` Rust API, so do not claim session-level timings for repeated CLI processes.
+
+Positive use means selecting semantic regions and checking `truncated: false`. Do not request
+`A1:XFD1048576` or all sheets merely because the declared dimension is large; do not infer that
+style-only cells contain data; and do not use Chrome, PDF conversion, or screenshots as the
+default XLSX read path. Legacy `.xls`, encrypted workbooks, macro execution, chart reconstruction,
+image OCR, and Excel-accurate visual rendering are outside this capability.
 
 ## Read: use Chrome rendering when needed
 

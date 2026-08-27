@@ -24,13 +24,14 @@ Opsail 是一个模块化原生工具集，通过统一的命令行入口，为�
 
 ## 核心能力
 
-### 读取 HTML
+### 读取 HTML 与 XLSX
 
-`opsail read` 可以将静态 HTML 或浏览器渲染后的 DOM 转换为易读的 Markdown、经过清理的 HTML 或带版本的 JSON。输入可以来自 URL、文件、stdin、由 Opsail 启动的隔离 Chrome，或显式借用的 CDP 端点。
+`opsail read` 可以将静态 HTML 或浏览器渲染后的 DOM 转换为易读的 Markdown、经过清理的 HTML 或带版本的 JSON，也可以稀疏读取本地 XLSX 的受控范围。HTML 输入可以来自 URL、文件、stdin、由 Opsail 启动的隔离 Chrome，或显式借用的 CDP 端点。
 
 ```sh
 opsail read https://example.com/article
 opsail read https://example.com/app --launch
+opsail read ./book.xlsx --max-bytes 67108864 --range 'Summary!A1:H30' --format json
 ```
 
 内容获取、正文提取、结果契约和 Rust API 请参阅 [`opsail-read`](https://github.com/lencx/opsail/blob/main/crates/opsail-read/README.md)；Chrome 发现、自有启动、借用 CDP、页面导航和渲染 DOM 捕获请参阅 [`opsail-chrome`](https://github.com/lencx/opsail/blob/main/crates/opsail-chrome/README.md)。

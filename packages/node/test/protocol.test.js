@@ -40,6 +40,135 @@ function validResult() {
   };
 }
 
+function validWorkbookResult() {
+  return {
+    schemaVersion: 1,
+    artifactKind: "workbook",
+    content: "# Workbook: example.xlsx",
+    contentHtml: "<article></article>",
+    metadata: { title: "example.xlsx" },
+    source: {
+      kind: "file",
+      requested: "example.xlsx",
+      contentType:
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      charset: "binary",
+      bytes: 1024,
+    },
+    extraction: { method: "ooxml-sparse", durationMs: 2, durationMicros: 2000 },
+    revision: {
+      id: "fnv1a64-0123456789abcdef",
+      compressedBytes: 1024,
+      expandedBytes: 2048,
+      parts: [
+        {
+          name: "xl/worksheets/sheet1.xml",
+          crc32: "0123abcd",
+          compressedBytes: 512,
+          expandedBytes: 1024,
+        },
+      ],
+    },
+    workbook: {
+      format: "xlsx",
+      dateSystem: "excel1900",
+      sheets: [
+        {
+          index: 0,
+          name: "Data",
+          part: "xl/worksheets/sheet1.xml",
+          revision: {
+            name: "xl/worksheets/sheet1.xml",
+            crc32: "0123abcd",
+            compressedBytes: 512,
+            expandedBytes: 1024,
+          },
+          state: "visible",
+          declaredDimension: "A1:XFD99",
+          semanticBounds: "A1:A1",
+          semanticBoundsComplete: false,
+          selected: true,
+          mergedRanges: [],
+          hiddenRows: 0,
+          hiddenColumns: 0,
+          features: {
+            scanned: true,
+            complete: false,
+            featureReferencesTruncated: false,
+            formulaCells: 0,
+            hyperlinks: [],
+            tableParts: 0,
+            drawingParts: 0,
+            commentDrawingParts: 0,
+            conditionalFormatRules: 0,
+            conditionalFormatRanges: [],
+            dataValidationRules: 0,
+            dataValidationRanges: [],
+            pageSetup: false,
+            headerFooter: false,
+            outlinedRows: 0,
+            outlinedColumns: 0,
+            maxRowOutlineLevel: 0,
+            maxColumnOutlineLevel: 0,
+            sparklines: 0,
+            controls: 0,
+          },
+        },
+      ],
+      definedNames: [],
+      selections: [
+        {
+          requested: "Data!A1:B2",
+          sheet: "Data",
+          range: "A1:B2",
+          bounds: {
+            startRow: 1,
+            startColumn: 1,
+            endRow: 2,
+            endColumn: 2,
+          },
+          cells: [
+            {
+              reference: "A1",
+              row: 1,
+              column: 1,
+              valueType: "string",
+              value: "value",
+              display: "value",
+              richText: false,
+            },
+          ],
+          truncated: false,
+        },
+      ],
+      features: {
+        inventoryComplete: false,
+        cellFormats: 1,
+        customNumberFormats: 0,
+        richStringItems: 0,
+        themeParts: 1,
+        drawingParts: 0,
+        chartParts: 0,
+        imageParts: 0,
+        tableParts: 0,
+        commentParts: 0,
+        controlPropertyParts: 0,
+        macroProjectParts: 0,
+      },
+      statistics: {
+        archiveEntries: 4,
+        expandedBytesRead: 2048,
+        scannedSheets: 1,
+        cellElements: 2,
+        nonEmptyCells: 1,
+        styleOnlyCells: 1,
+        returnedCells: 1,
+      },
+    },
+    warnings: [],
+  };
+}
+
 function successResponse(result = validResult()) {
   return encode(machineEnvelope({ ok: true, result }));
 }
@@ -66,6 +195,51 @@ test("machine responses require a versioned ReadResult", () => {
     (error) =>
       error instanceof OpsailError && error.code === "invalid-response",
   );
+});
+
+test("machine responses accept a validated sparse workbook artifact", () => {
+  const result = validWorkbookResult();
+  assert.deepEqual(parseMachineResponse(successResponse(result), 0, null), result);
+});
+
+test("machine workbook validation rejects inconsistent structured fields", () => {
+  for (const mutate of [
+    (result) => {
+      result.artifactKind = "document";
+    },
+    (result) => {
+      result.extraction.method = "semantic";
+    },
+    (result) => {
+      result.workbook.sheets[0].state = "secret";
+    },
+    (result) => {
+      result.workbook.selections[0].bounds.endRow = 0;
+    },
+    (result) => {
+      result.workbook.selections[0].cells[0].valueType = "formula";
+    },
+    (result) => {
+      result.workbook.statistics.returnedCells = -1;
+    },
+    (result) => {
+      result.revision.id = "unstable";
+    },
+    (result) => {
+      result.workbook.sheets[0].features.complete = "yes";
+    },
+    (result) => {
+      result.workbook.selections[0].cells[0].richText = 1;
+    },
+  ]) {
+    const result = validWorkbookResult();
+    mutate(result);
+    assert.throws(
+      () => parseMachineResponse(successResponse(result), 0, null),
+      (error) =>
+        error instanceof OpsailError && error.code === "invalid-response",
+    );
+  }
 });
 
 test("machine responses require the Opsail engine identity", () => {

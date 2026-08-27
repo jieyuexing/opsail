@@ -29,6 +29,42 @@ const result = await read({
 });
 ```
 
+Local XLSX files return the `WorkbookReadResult` member of the `ReadArtifact`
+union. Batch repeated ranges in one request so native code opens the archive
+once and scans each selected worksheet once:
+
+```js
+const result = await read({
+  source: { kind: "file", path: "./book.xlsx" },
+  options: {
+    ranges: ["Summary!A1:H30", "'API Sheet'!B6:AY40"],
+    maxCells: 10_000,
+    maxExpandedBytes: 64 * 1024 * 1024,
+    includeFormulas: true,
+  },
+});
+```
+
+With no ranges, Opsail returns a bounded preview of visible sheets. It never
+allocates a dense rectangle from `declaredDimension`. Formulas are returned
+separately from stored cached values and are not recalculated.
+
+Use `revisionOnly` for a zero-expansion change probe before reusing a caller's
+cached result or Markdown mirror. It cannot be combined with ranges:
+
+```js
+const revision = await read({
+  source: { kind: "file", path: "./book.xlsx" },
+  options: { revisionOnly: true },
+});
+```
+
+The process-local `WorkbookSession` cache and generated-block Markdown merge
+are Rust-library APIs. The Node wrapper starts one native request per `read()`;
+applications that need the same collaboration loop must retain the previous
+result, compare revisions, and preserve text outside
+`opsail:xlsx-generated` blocks explicitly.
+
 For a `url` source, direct HTTP acquisition sends `opsail/<version>` by default;
 WeChat article URLs retain Opsail's browser-compatible automatic HTTP profile.
 Set `options.userAgent` to override either default explicitly.

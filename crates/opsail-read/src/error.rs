@@ -25,6 +25,24 @@ pub enum ReadError {
     #[error("input does not appear to be an HTML document")]
     NotHtml,
 
+    #[error("input is not a valid XLSX workbook: {0}")]
+    InvalidXlsx(String),
+
+    #[error("Markdown is not a valid Opsail XLSX mirror: {0}")]
+    InvalidMarkdownMirror(String),
+
+    #[error("invalid spreadsheet range `{selector}`: {reason}")]
+    InvalidSpreadsheetRange { selector: String, reason: String },
+
+    #[error("spreadsheet worksheet `{0}` was not found")]
+    WorksheetNotFound(String),
+
+    #[error("spreadsheet OOXML exceeds the {limit} expanded byte limit")]
+    SpreadsheetExpandedTooLarge { limit: usize },
+
+    #[error("spreadsheet extraction task failed")]
+    SpreadsheetTask,
+
     #[error("unsupported response content type `{0}`")]
     UnsupportedContentType(String),
 

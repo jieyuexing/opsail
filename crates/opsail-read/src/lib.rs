@@ -6,6 +6,7 @@ mod model;
 mod source;
 mod standardize;
 mod verification;
+mod xlsx;
 
 use std::time::Instant;
 
@@ -15,10 +16,47 @@ use url::Url;
 pub use error::ReadError;
 pub use model::{
     CapturedDocument, DEFAULT_CONNECT_TIMEOUT, DEFAULT_MAX_BYTES, DEFAULT_MAX_DEPTH,
-    DEFAULT_MAX_ELEMENTS, DEFAULT_TIMEOUT, DocumentMetadata, ExtractionInfo, ExtractionMethod,
-    Input, QualityGrade, QualityInfo, ReadOptions, ReadResult, ReadSource, SourceInfo, SourceKind,
+    DEFAULT_MAX_ELEMENTS, DEFAULT_MAX_SPREADSHEET_CELLS, DEFAULT_MAX_SPREADSHEET_EXPANDED_BYTES,
+    DEFAULT_SPREADSHEET_PREVIEW_COLUMNS, DEFAULT_SPREADSHEET_PREVIEW_ROWS, DEFAULT_TIMEOUT,
+    DocumentMetadata, ExtractionInfo, ExtractionMethod, Input, QualityGrade, QualityInfo,
+    ReadArtifact, ReadOptions, ReadResult, ReadSource, SourceInfo, SourceKind,
+    SpreadsheetReadOptions,
 };
 pub use opsail_chrome::{CdpSource, CdpWaitUntil, ChromeError, ChromeSource};
+pub use xlsx::{
+    ArtifactKind, CellValueType, DateSystem, DefinedName, FormulaKind, SelectionBounds, SheetState,
+    WorkbookCell, WorkbookExtractionInfo, WorkbookExtractionMethod, WorkbookFeatureInventory,
+    WorkbookHyperlink, WorkbookInfo, WorkbookMetadata, WorkbookPartRevision, WorkbookReadResult,
+    WorkbookRevision, WorkbookRevisionDiff, WorkbookSelection, WorkbookSession,
+    WorkbookSessionMetrics, WorkbookSessionRefresh, WorkbookSheet, WorkbookStatistics,
+    WorksheetFeatureInventory, inspect_workbook_revision, merge_markdown_mirror,
+};
+
+/// Auto-detect and read a supported document artifact.
+///
+/// Local files ending in `.xlsx` use the bounded sparse OOXML reader. Other
+/// inputs preserve the existing HTML acquisition and extraction behavior.
+pub async fn read_artifact(
+    source: ReadSource,
+    options: &ReadOptions,
+) -> Result<ReadArtifact, ReadError> {
+    if let ReadSource::File(path) = &source
+        && xlsx::is_xlsx_path(path)
+    {
+        let path = path.clone();
+        let options = options.clone();
+        let workbook = tokio::task::spawn_blocking(move || xlsx::read_xlsx(path, &options))
+            .await
+            .map_err(|_| ReadError::SpreadsheetTask)??;
+        return Ok(ReadArtifact::Workbook(workbook));
+    }
+    if options.spreadsheet.revision_only {
+        return Err(ReadError::InvalidXlsx(
+            "revision-only reads require a local .xlsx file".to_owned(),
+        ));
+    }
+    read(source, options).await.map(ReadArtifact::Document)
+}
 
 /// Acquire and extract one HTML document.
 pub async fn read(source: ReadSource, options: &ReadOptions) -> Result<ReadResult, ReadError> {
