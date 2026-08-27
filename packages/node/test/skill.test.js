@@ -108,6 +108,9 @@ test("bootstrap is independently versioned and runtime matches the public packag
   ]);
   assert(opsailMetadata.hermes);
   assert.match(opsailSkill, /`read` extracts readable content/);
+  assert.match(opsailSkill, /opsail read '\.\/book\.xlsx'/);
+  assert.match(opsailSkill, /--range 'Summary!A1:H30'/);
+  assert.match(opsailSkill, /A1:XFD1048576/);
   assert.match(opsailSkill, /opsail usage/);
   assert.match(opsailSkill, /opsail usage codex/);
   assert.match(opsailSkill, /opsail usage grok/);

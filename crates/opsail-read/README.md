@@ -1,10 +1,10 @@
 # opsail-read
 
 `opsail-read` is the Rust library behind
-[`opsail read`](https://github.com/lencx/opsail#read-html). It acquires static HTML
-or delegates rendered DOM capture to `opsail-chrome`, extracts the primary
-document, sanitizes the result, and returns a versioned `ReadResult` suitable
-for agents and other programmatic callers.
+[`opsail read`](https://github.com/lencx/opsail#read-html). It acquires static
+HTML or delegates rendered DOM capture to `opsail-chrome`, and it sparsely reads
+bounded regions from local XLSX workbooks. Both paths return versioned artifacts
+suitable for agents and other programmatic callers.
 
 The extraction pipeline is browser-independent. `opsail-read` owns source
 validation, non-browser acquisition, extraction, sanitization, and result
@@ -23,6 +23,17 @@ browser path.
   capture one page, and clean up the owned process and profile.
 - Resolve relative links and assets against a validated HTTP(S) base URL.
 - Extract readable Markdown and sanitized HTML with structured metadata.
+- Read local XLSX sheet manifests and repeated `Sheet!A1:D20` ranges without
+  allocating from declared worksheet dimensions.
+- Parse shared and inline strings, stored values, formulas and cached results,
+  supported date/time number formats, merged ranges, hidden state, and defined
+  names from OOXML.
+- Inventory hyperlinks, filters, tables, conditional formats, validations,
+  page setup, outlines, drawings, charts, images, comments, controls,
+  sparklines, themes, and VBA-project presence without executing active content.
+- Compare ZIP-part revisions without expanding OOXML, refresh changed worksheet
+  selections through `WorkbookSession`, and merge generated Markdown blocks
+  without overwriting agent-authored text.
 - Report source, extraction method, quality signals, and warnings through one
   stable result model.
 - Enforce byte, DOM element, nesting-depth, redirect, and timeout limits.
@@ -64,6 +75,95 @@ cookies; other-host and HTTPS to HTTP redirects are refused. For direct HTTP
 acquisition, leaving `user_agent` as `None` sends `opsail/<version>`; WeChat
 article URLs retain their browser-compatible automatic HTTP profile with an
 `opsail/<version>` product token. An explicit value always wins.
+
+## Read bounded XLSX ranges
+
+Use `read_artifact` for auto-detection. A local file ending in `.xlsx` returns
+`ReadArtifact::Workbook`; other inputs preserve the existing
+`ReadArtifact::Document` path:
+
+```rust
+use opsail_read::{ReadArtifact, ReadOptions, ReadSource, read_artifact};
+
+async fn inspect(path: std::path::PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let mut options = ReadOptions::default();
+    options.spreadsheet.ranges = vec![
+        "Summary!A1:H30".to_owned(),
+        "'API Sheet'!B6:AY40".to_owned(),
+    ];
+    let artifact = read_artifact(ReadSource::File(path), &options).await?;
+    if let ReadArtifact::Workbook(result) = artifact {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    }
+    Ok(())
+}
+```
+
+Repeated ranges are planned before extraction. The archive, workbook metadata,
+shared strings, and styles are read once, and each selected worksheet XML part
+is scanned once. Cells are stored sparsely by reference; a declared dimension
+such as `A1:XFD1048576` never causes rectangular allocation.
+
+With no explicit ranges, visible sheets receive a bounded preview controlled by
+`preview_rows` and `preview_columns`; hidden sheets remain in the manifest.
+`max_cells` bounds published non-empty cells and marks affected selections as
+truncated. `max_expanded_bytes` limits cumulative uncompressed OOXML read from
+the ZIP package. The normal `max_bytes` limit still applies to the compressed
+file itself. Stdout adapters can call `WorkbookReadResult::truncate_published_cells`
+and rerender a stable prefix when their serialized transport has a stricter byte
+budget than the cell-count limit.
+
+Formula expressions and cached values are reported separately. Opsail does not
+recalculate formulas, so callers must not describe the cached value as current.
+Legacy `.xls`, encrypted workbooks, macros, charts, images, conditional-format
+rendering, and Excel-accurate visual layout are outside this reader.
+
+The read-side feature levels, completeness labels, human/agent mirror contract,
+and 80% efficiency gate are specified in
+[`XLSX_COMPATIBILITY.md`](XLSX_COMPATIBILITY.md).
+
+## Refresh a human-owned workbook without losing agent Markdown
+
+`WorkbookSession` is the in-process collaboration API. Keep the XLSX as the
+human-owned source and keep agent analysis outside the generated marker blocks:
+
+```rust
+use opsail_read::{ReadOptions, WorkbookSession, merge_markdown_mirror};
+
+fn refresh(
+    path: std::path::PathBuf,
+    mut mirror: String,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut session = WorkbookSession::open(path, ReadOptions::default())?;
+    if mirror.is_empty() {
+        mirror = session.result().content.clone();
+    }
+
+    // The agent can append or edit text outside opsail:xlsx-generated blocks.
+    mirror.push_str("\n\n## Agent analysis\n\nPending human confirmation.\n");
+    let refresh = session.refresh()?;
+    Ok(merge_markdown_mirror(&mirror, refresh.result)?)
+}
+```
+
+An unchanged file uses a metadata fast path and expands zero OOXML bytes. A
+worksheet-only change reuses cached shared strings/styles, parses only the
+previous selections on changed sheets, and incrementally replaces generated
+Markdown/HTML blocks. Workbook, shared-string, style, and theme changes take a
+conservative full-refresh path. A full refresh is a correctness fallback, not
+an efficiency failure hidden as a partial read.
+
+Run the collaboration benchmark against a workbook tree with:
+
+```sh
+cargo +1.97.0 run --release -p opsail-read \
+  --example xlsx_collaboration_benchmark -- \
+  --md-rounds 4 --edit-samples 100 /path/to/workbooks
+```
+
+The benchmark never changes source files. It edits numeric, non-formula cells
+only in temporary copies, compares every incremental selection with a cold
+read, and verifies that agent-authored Markdown survives.
 
 ## Process caller-captured HTML
 
@@ -211,7 +311,12 @@ response URL must also match the captured final main document.
 
 ## Result contract
 
-Every successful entry point returns `ReadResult`, which contains:
+`read` preserves the existing HTML-only `ReadResult`. `read_artifact` returns
+the untagged `ReadArtifact` union: existing documents keep their version 1
+shape, while workbooks carry `artifactKind: "workbook"` and their own version 1
+shape. CLI and Node callers use the latter auto-detected contract.
+
+An HTML `ReadResult` contains:
 
 - `schema_version`: version of the serialized result contract.
 - `content` and `content_html`: readable Markdown and sanitized HTML.
@@ -224,6 +329,19 @@ Every successful entry point returns `ReadResult`, which contains:
 
 Serialized fields use camel case, including `schemaVersion` and `contentHtml`.
 Callers should branch on structured fields rather than warning or error text.
+
+A `WorkbookReadResult` contains common `content`, `contentHtml`, `metadata`,
+`source`, and `warnings` fields plus:
+
+- `artifactKind: "workbook"`.
+- `extraction.method: "ooxml-sparse"`.
+- `workbook.sheets`: visibility, declared dimensions, scanned semantic bounds,
+  merge and hidden-row/column metadata.
+- `workbook.definedNames`: scope, reference, and explicit `#REF!` validity.
+- `workbook.selections`: requested/resolved bounds, sparse cell records, and
+  truncation.
+- `workbook.statistics`: archive, expanded-byte, scan, style-only, and returned
+  cell counts.
 
 ## Trust boundary
 

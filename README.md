@@ -24,13 +24,14 @@ Opsail is a modular native toolkit that gives software agents small, composable,
 
 ## Core capabilities
 
-### Read HTML
+### Read HTML and XLSX
 
-`opsail read` turns static HTML or a browser-rendered DOM into readable Markdown, sanitized HTML, or versioned JSON. It accepts URLs, files, stdin, an Opsail-owned isolated Chrome process, or an explicitly borrowed CDP endpoint.
+`opsail read` turns static HTML or a browser-rendered DOM into readable Markdown, sanitized HTML, or versioned JSON. It also reads bounded sparse ranges from local XLSX workbooks. HTML accepts URLs, files, stdin, an Opsail-owned isolated Chrome process, or an explicitly borrowed CDP endpoint.
 
 ```sh
 opsail read https://example.com/article
 opsail read https://example.com/app --launch
+opsail read ./book.xlsx --max-bytes 67108864 --range 'Summary!A1:H30' --format json
 ```
 
 See [`opsail-read`](https://github.com/lencx/opsail/blob/main/crates/opsail-read/README.md) for acquisition, extraction, result contracts, and Rust APIs. See [`opsail-chrome`](https://github.com/lencx/opsail/blob/main/crates/opsail-chrome/README.md) for Chrome discovery, owned launch, borrowed CDP, navigation, and rendered DOM capture.

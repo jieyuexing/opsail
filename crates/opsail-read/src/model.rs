@@ -10,6 +10,10 @@ use url::Url;
 pub const DEFAULT_MAX_BYTES: usize = 5 * 1024 * 1024;
 pub const DEFAULT_MAX_ELEMENTS: usize = 50_000;
 pub const DEFAULT_MAX_DEPTH: usize = 256;
+pub const DEFAULT_MAX_SPREADSHEET_CELLS: usize = 10_000;
+pub const DEFAULT_MAX_SPREADSHEET_EXPANDED_BYTES: usize = 64 * 1024 * 1024;
+pub const DEFAULT_SPREADSHEET_PREVIEW_ROWS: u32 = 24;
+pub const DEFAULT_SPREADSHEET_PREVIEW_COLUMNS: u16 = 16;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const DEFAULT_USER_AGENT: &str = concat!("opsail/", env!("CARGO_PKG_VERSION"));
@@ -103,6 +107,43 @@ pub struct ReadOptions {
     pub accept_language: Option<String>,
     /// Cookies for direct URL acquisition only. Never written to results.
     pub cookies: Option<crate::cookie::CookieSource>,
+    /// XLSX range selection and resource limits.
+    pub spreadsheet: SpreadsheetReadOptions,
+}
+
+/// Options for bounded, sparse XLSX extraction.
+#[derive(Debug, Clone)]
+pub struct SpreadsheetReadOptions {
+    /// Repeated `Sheet!A1:D20` selectors. With no selectors, visible sheets get
+    /// a bounded preview instead of an unbounded workbook dump.
+    pub ranges: Vec<String>,
+    /// Maximum number of non-empty cell records published across selections.
+    pub max_cells: usize,
+    /// Maximum cumulative uncompressed OOXML bytes read from the ZIP package.
+    pub max_expanded_bytes: usize,
+    /// Preview row count used when no explicit ranges are supplied.
+    pub preview_rows: u32,
+    /// Preview column count used when no explicit ranges are supplied.
+    pub preview_columns: u16,
+    /// Include formula expressions alongside cached workbook values.
+    pub include_formulas: bool,
+    /// Return the central-directory revision and workbook manifest without
+    /// expanding shared strings, styles, or worksheet XML.
+    pub revision_only: bool,
+}
+
+impl Default for SpreadsheetReadOptions {
+    fn default() -> Self {
+        Self {
+            ranges: Vec::new(),
+            max_cells: DEFAULT_MAX_SPREADSHEET_CELLS,
+            max_expanded_bytes: DEFAULT_MAX_SPREADSHEET_EXPANDED_BYTES,
+            preview_rows: DEFAULT_SPREADSHEET_PREVIEW_ROWS,
+            preview_columns: DEFAULT_SPREADSHEET_PREVIEW_COLUMNS,
+            include_formulas: true,
+            revision_only: false,
+        }
+    }
 }
 
 impl Default for ReadOptions {
@@ -115,6 +156,7 @@ impl Default for ReadOptions {
             user_agent: None,
             accept_language: None,
             cookies: None,
+            spreadsheet: SpreadsheetReadOptions::default(),
         }
     }
 }
@@ -129,6 +171,7 @@ impl std::fmt::Debug for ReadOptions {
             .field("user_agent", &self.user_agent)
             .field("accept_language", &self.accept_language)
             .field("cookies", &self.cookies.as_ref().map(|_| "[redacted]"))
+            .field("spreadsheet", &self.spreadsheet)
             .finish()
     }
 }
@@ -231,6 +274,44 @@ pub struct ReadResult {
     pub extraction: ExtractionInfo,
     pub quality: QualityInfo,
     pub warnings: Vec<String>,
+}
+
+/// Auto-detected artifact returned by [`crate::read_artifact`].
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum ReadArtifact {
+    Document(ReadResult),
+    Workbook(crate::xlsx::WorkbookReadResult),
+}
+
+impl ReadArtifact {
+    pub fn content(&self) -> &str {
+        match self {
+            Self::Document(result) => &result.content,
+            Self::Workbook(result) => &result.content,
+        }
+    }
+
+    pub fn content_html(&self) -> &str {
+        match self {
+            Self::Document(result) => &result.content_html,
+            Self::Workbook(result) => &result.content_html,
+        }
+    }
+
+    pub fn warnings(&self) -> &[String] {
+        match self {
+            Self::Document(result) => &result.warnings,
+            Self::Workbook(result) => &result.warnings,
+        }
+    }
+
+    pub fn property(&self, name: &str) -> Option<Value> {
+        match self {
+            Self::Document(result) => result.property(name),
+            Self::Workbook(result) => result.property(name),
+        }
+    }
 }
 
 impl ReadResult {

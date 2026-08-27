@@ -30,6 +30,7 @@ libc = "0.2.183"
 predicates = "3.1.4"
 process-wrap = { version = "9.1.0", default-features = false, features = ["job-object", "kill-on-drop", "tokio1"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["brotli", "charset", "gzip", "http2", "rustls-no-provider", "stream", "system-proxy", "zstd"] }
+quick-xml = "0.39.4"
 ring = "0.17.14"
 rustls = { version = "0.23.42", default-features = false, features = ["ring", "std", "tls12"] }
 semver = "1.0.28"
@@ -45,6 +46,7 @@ unicode-segmentation = "1.13.3"
 url = { version = "2.5.8", features = ["serde"] }
 wiremock = "0.6.5"
 windows = "0.62.2"
+zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -4,8 +4,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use opsail_read::{
-    CapturedDocument, CdpSource, CdpWaitUntil, ChromeError, ChromeSource, CookieSource, ReadError,
-    ReadOptions, ReadResult, ReadSource, read,
+    CapturedDocument, CdpSource, CdpWaitUntil, ChromeError, ChromeSource, CookieSource,
+    ReadArtifact, ReadError, ReadOptions, ReadSource, read_artifact,
 };
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
@@ -84,6 +84,13 @@ struct MachineOptions {
     timeout_ms: Option<u64>,
     max_bytes: Option<usize>,
     cookie_file: Option<String>,
+    #[serde(default)]
+    ranges: Vec<String>,
+    max_cells: Option<usize>,
+    max_expanded_bytes: Option<usize>,
+    include_formulas: Option<bool>,
+    #[serde(default)]
+    revision_only: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -99,7 +106,7 @@ struct SuccessResponse {
     protocol_version: u8,
     ok: bool,
     engine: EngineInfo,
-    result: ReadResult,
+    result: ReadArtifact,
 }
 
 #[derive(Debug, Serialize)]
@@ -177,7 +184,7 @@ pub(crate) async fn run() -> ExitCode {
     }
 }
 
-async fn execute() -> Result<ReadResult, MachineFailure> {
+async fn execute() -> Result<ReadArtifact, MachineFailure> {
     let bytes = read_request().await?;
     let request: MachineRequest = serde_json::from_slice(&bytes).map_err(|_| {
         MachineFailure::new(
@@ -199,7 +206,7 @@ async fn execute() -> Result<ReadResult, MachineFailure> {
     }
 
     let (input, options) = request.into_read_request()?;
-    read(input, &options)
+    read_artifact(input, &options)
         .await
         .map_err(MachineFailure::from_read_error)
 }
@@ -248,6 +255,37 @@ impl MachineRequest {
                 ));
             }
             options.max_bytes = max_bytes;
+        }
+        if self.options.ranges.iter().any(String::is_empty) {
+            return Err(MachineFailure::invalid_option(
+                "options.ranges must not contain empty selectors",
+            ));
+        }
+        options.spreadsheet.ranges = self.options.ranges;
+        if self.options.revision_only && !options.spreadsheet.ranges.is_empty() {
+            return Err(MachineFailure::invalid_option(
+                "options.revisionOnly cannot be combined with options.ranges",
+            ));
+        }
+        options.spreadsheet.revision_only = self.options.revision_only;
+        if let Some(max_cells) = self.options.max_cells {
+            if max_cells == 0 {
+                return Err(MachineFailure::invalid_option(
+                    "options.maxCells must be greater than zero",
+                ));
+            }
+            options.spreadsheet.max_cells = max_cells;
+        }
+        if let Some(max_expanded_bytes) = self.options.max_expanded_bytes {
+            if max_expanded_bytes == 0 {
+                return Err(MachineFailure::invalid_option(
+                    "options.maxExpandedBytes must be greater than zero",
+                ));
+            }
+            options.spreadsheet.max_expanded_bytes = max_expanded_bytes;
+        }
+        if let Some(include_formulas) = self.options.include_formulas {
+            options.spreadsheet.include_formulas = include_formulas;
         }
         if let Some(cookie_file) = self.options.cookie_file {
             if cookie_file.is_empty() {
@@ -481,6 +519,36 @@ impl MachineFailure {
                 "not-html",
                 FailureStage::Input,
                 "source does not appear to be HTML",
+            ),
+            ReadError::InvalidXlsx(_) => Self::new(
+                "invalid-xlsx",
+                FailureStage::Extract,
+                "source does not appear to be a valid XLSX workbook",
+            ),
+            ReadError::InvalidMarkdownMirror(_) => Self::new(
+                "invalid-markdown-mirror",
+                FailureStage::Input,
+                "Markdown mirror contains invalid or conflicting generated block markers",
+            ),
+            ReadError::InvalidSpreadsheetRange { .. } => Self::new(
+                "invalid-spreadsheet-range",
+                FailureStage::Input,
+                "spreadsheet range must use Sheet!A1:D20 form and valid Excel bounds",
+            ),
+            ReadError::WorksheetNotFound(_) => Self::new(
+                "worksheet-not-found",
+                FailureStage::Input,
+                "the requested spreadsheet worksheet was not found",
+            ),
+            ReadError::SpreadsheetExpandedTooLarge { limit } => Self::new(
+                "spreadsheet-too-large",
+                FailureStage::Extract,
+                format!("spreadsheet OOXML exceeds the {limit} expanded byte limit"),
+            ),
+            ReadError::SpreadsheetTask => Self::new(
+                "spreadsheet-extraction-failed",
+                FailureStage::Extract,
+                "spreadsheet extraction task failed",
             ),
             ReadError::UnsupportedContentType(_) => Self::new(
                 "unsupported-content-type",
