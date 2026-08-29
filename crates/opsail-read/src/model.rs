@@ -117,7 +117,8 @@ pub struct SpreadsheetReadOptions {
     /// Repeated `Sheet!A1:D20` selectors. With no selectors, visible sheets get
     /// a bounded preview instead of an unbounded workbook dump.
     pub ranges: Vec<String>,
-    /// Maximum number of non-empty cell records published across selections.
+    /// Maximum number of cell records published across selections, including
+    /// blank requested cells that carry merge-covered membership evidence.
     pub max_cells: usize,
     /// Maximum cumulative uncompressed OOXML bytes read from the ZIP package.
     pub max_expanded_bytes: usize,

@@ -27,11 +27,14 @@ pub use model::{
 pub use opsail_chrome::{CdpSource, CdpWaitUntil, ChromeError, ChromeSource};
 pub use xlsx::{
     ArtifactKind, CellValueType, DateSystem, DefinedName, FormulaKind, SelectionBounds, SheetState,
-    WorkbookCell, WorkbookExtractionInfo, WorkbookExtractionMethod, WorkbookFeatureInventory,
-    WorkbookHyperlink, WorkbookInfo, WorkbookMetadata, WorkbookPartRevision, WorkbookReadResult,
-    WorkbookRevision, WorkbookRevisionDiff, WorkbookSelection, WorkbookSession,
-    WorkbookSessionMetrics, WorkbookSessionRefresh, WorkbookSheet, WorkbookStatistics,
-    WorksheetFeatureInventory, inspect_workbook_revision, merge_markdown_mirror,
+    WorkbookCell, WorkbookColumnOverflow, WorkbookExtractionInfo, WorkbookExtractionMethod,
+    WorkbookFeatureInventory, WorkbookFontColor, WorkbookHyperlink, WorkbookInfo,
+    WorkbookMergeMembership, WorkbookMergeRole, WorkbookMetadata, WorkbookPartRevision,
+    WorkbookPicture, WorkbookReadResult, WorkbookRevision, WorkbookRevisionDiff,
+    WorkbookRichTextRun, WorkbookRowOverflow, WorkbookSelection, WorkbookSelectionOverflow,
+    WorkbookSession, WorkbookSessionMetrics, WorkbookSessionRefresh, WorkbookSheet,
+    WorkbookStatistics, WorksheetFeatureInventory, WorksheetPageSetup, WorksheetPrintEvidence,
+    WorksheetPrintOptions, inspect_workbook_revision, merge_markdown_mirror,
 };
 
 /// Auto-detect and read a supported document artifact.
