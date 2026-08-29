@@ -64,7 +64,12 @@ opsail read './book.xlsx' \
 `--max-expanded-bytes` limits cumulative uncompressed OOXML bytes. `--no-formulas` omits formula
 expressions but preserves cached values. Formula values are never recalculated and may be stale.
 Treat `declaredDimension`, `semanticBounds`, `styleOnlyCells`, `truncated`, invalid defined names,
-and warnings as separate evidence.
+and warnings as separate evidence. Scanned sheets inventory worksheet pictures in metadata-only
+`pictures`; intersecting selections publish `images` with anchors, media metadata, SHA-256, and a
+bounded `dataUri` when available. Picture references are capped at 256 per sheet/selection; open
+the URI directly or decode its base64 bytes. Image
+`imagesTruncated`/`payloadTruncated` signals are independent from cell `truncated`; pictures are
+not OCR text.
 
 For a repeated read, probe the content revision before rereading cell XML:
 
@@ -75,7 +80,8 @@ opsail read './book.xlsx' --revision-only --property revision --format json
 Reuse an existing Markdown mirror when the revision is unchanged. When a worksheet part changed,
 reread the previously selected ranges in one invocation and replace only matching
 `opsail:xlsx-generated` blocks; keep agent-authored text outside those blocks. Workbook,
-shared-string, style, or theme changes are dependency-wide and require a conservative full read.
+shared-string, style, theme, drawing, or media changes are dependency-wide and require a
+conservative full read.
 The CLI invocation itself is stateless; the high-efficiency `WorkbookSession` cache is an
 in-process `opsail-read` Rust API, so do not claim session-level timings for repeated CLI processes.
 

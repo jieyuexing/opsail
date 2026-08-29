@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
@@ -7,6 +7,7 @@ use std::time::SystemTime;
 
 use quick_xml::Reader;
 use quick_xml::events::{BytesRef, BytesStart, Event};
+use ring::digest::{SHA256, digest};
 use serde::Serialize;
 use serde_json::{Value, json};
 use url::Url;
@@ -20,6 +21,12 @@ const XLSX_CONTENT_TYPE: &str = "application/vnd.openxmlformats-officedocument.s
 const PREVIEW_GRID_MAX_AREA: u64 = 2_000;
 const MAX_CELL_TEXT_BYTES: usize = 32_767 * 4;
 const MAX_FEATURE_REFERENCES: usize = 10_000;
+const MAX_IMAGE_REFERENCES: usize = 256;
+/// Raw image bytes are capped below the 16 MiB Host response ceiling. Base64
+/// expands the total to at most about 5.4 MiB, leaving room for cells and the
+/// duplicated Markdown/HTML evidence.
+const MAX_IMAGE_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
+const MAX_TOTAL_IMAGE_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -209,6 +216,7 @@ pub struct WorkbookSession {
 struct WorkbookSessionContext {
     shared_strings: Vec<SharedString>,
     styles: Styles,
+    content_types: PackageContentTypes,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -261,6 +269,8 @@ impl WorkbookRevision {
                     | "xl/sharedStrings.xml"
                     | "xl/styles.xml"
             ) || name.starts_with("xl/theme/")
+                || name.starts_with("xl/drawings/")
+                || name.starts_with("xl/media/")
         });
         WorkbookRevisionDiff {
             unchanged: changed_parts.is_empty(),
@@ -457,8 +467,12 @@ pub struct WorkbookSheet {
     pub semantic_bounds_complete: bool,
     pub selected: bool,
     pub merged_ranges: Vec<String>,
+    /// Worksheet pictures. Inventory entries never carry `dataUri`; pixel
+    /// payloads are published only on intersecting selections.
+    pub pictures: Vec<WorkbookPicture>,
     pub hidden_rows: usize,
     pub hidden_columns: usize,
+    pub print: WorksheetPrintEvidence,
     pub features: WorksheetFeatureInventory,
 }
 
@@ -466,6 +480,11 @@ pub struct WorkbookSheet {
 #[serde(rename_all = "camelCase")]
 pub struct WorksheetFeatureInventory {
     pub scanned: bool,
+    /// True only when every cell element in `sheetData` was inspected.
+    pub cell_data_complete: bool,
+    /// True when parsing reached the end of the worksheet, including features
+    /// serialized after `sheetData`.
+    pub tail_features_complete: bool,
     pub complete: bool,
     pub feature_references_truncated: bool,
     pub formula_cells: usize,
@@ -487,6 +506,48 @@ pub struct WorksheetFeatureInventory {
     pub max_column_outline_level: u8,
     pub sparklines: usize,
     pub controls: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorksheetPrintEvidence {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub print_area: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub print_titles: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_setup: Option<WorksheetPageSetup>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub print_options: Option<WorksheetPrintOptions>,
+    pub row_breaks: Vec<u32>,
+    pub column_breaks: Vec<u32>,
+    pub header_footer: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorksheetPageSetup {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orientation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paper_size: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fit_to_page: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fit_to_width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fit_to_height: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scale: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorksheetPrintOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grid_lines: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headings: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -527,8 +588,76 @@ pub struct WorkbookSelection {
     pub sheet: String,
     pub range: String,
     pub bounds: SelectionBounds,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub used_bounds: Option<String>,
+    pub merged_ranges: Vec<String>,
+    /// Pictures whose anchors intersect this selection. Payloads are bounded
+    /// independently from the cell cap.
+    pub images: Vec<WorkbookPicture>,
+    pub images_truncated: bool,
+    #[serde(skip_serializing_if = "WorkbookSelectionOverflow::is_empty")]
+    pub overflow: WorkbookSelectionOverflow,
     pub cells: Vec<WorkbookCell>,
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkbookPicture {
+    pub sheet: String,
+    pub from_cell: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_cell: Option<String>,
+    /// Zero-based OOXML drawing marker row index.
+    pub from_row_index: u32,
+    /// Zero-based OOXML drawing marker column index.
+    pub from_column_index: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_row_index: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_column_index: Option<u32>,
+    pub media_part: String,
+    pub content_type: String,
+    pub byte_size: usize,
+    pub sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_uri: Option<String>,
+    pub payload_truncated: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkbookSelectionOverflow {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub left: Option<WorkbookColumnOverflow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub right: Option<WorkbookColumnOverflow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub above: Option<WorkbookRowOverflow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub below: Option<WorkbookRowOverflow>,
+}
+
+impl WorkbookSelectionOverflow {
+    fn is_empty(&self) -> bool {
+        self.left.is_none() && self.right.is_none() && self.above.is_none() && self.below.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkbookColumnOverflow {
+    pub min_column: u16,
+    pub max_column: u16,
+    pub cell_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkbookRowOverflow {
+    pub min_row: u32,
+    pub max_row: u32,
+    pub cell_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -559,9 +688,59 @@ pub struct WorkbookCell {
     pub shared_formula_index: Option<u32>,
     pub rich_text: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub font_strike: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub font_color: Option<WorkbookFontColor>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rich_text_runs: Vec<WorkbookRichTextRun>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge: Option<WorkbookMergeMembership>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub style_index: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub number_format: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkbookMergeMembership {
+    pub range: String,
+    pub anchor: String,
+    pub role: WorkbookMergeRole,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkbookMergeRole {
+    Anchor,
+    Covered,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkbookFontColor {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rgb: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub theme: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indexed: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tint: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_rgb: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkbookRichTextRun {
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strike: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub font_color: Option<WorkbookFontColor>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -622,6 +801,9 @@ struct SelectionPlan {
 struct Styles {
     custom_formats: HashMap<u32, String>,
     cell_formats: Vec<u32>,
+    fonts: Vec<FontFormat>,
+    cell_font_indexes: Vec<Option<usize>>,
+    theme: Vec<Option<String>>,
 }
 
 impl Styles {
@@ -632,12 +814,24 @@ impl Styles {
             .cloned()
             .or_else(|| builtin_number_format(id).map(str::to_owned))
     }
+
+    fn font(&self, style_index: Option<usize>) -> Option<&FontFormat> {
+        let font_index = (*self.cell_font_indexes.get(style_index?)?)?;
+        self.fonts.get(font_index)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct FontFormat {
+    strike: Option<bool>,
+    color: Option<WorkbookFontColor>,
 }
 
 #[derive(Debug, Clone)]
 struct SharedString {
     text: String,
     rich: bool,
+    runs: Vec<WorkbookRichTextRun>,
 }
 
 #[derive(Debug, Clone)]
@@ -645,6 +839,52 @@ struct PartRelationship {
     relationship_type: String,
     target: String,
     external: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PackageContentTypes {
+    defaults: HashMap<String, String>,
+    overrides: HashMap<String, String>,
+}
+
+impl PackageContentTypes {
+    fn for_part(&self, part: &str) -> Option<String> {
+        let part = part.trim_start_matches('/');
+        self.overrides.get(part).cloned().or_else(|| {
+            let extension = part.rsplit_once('.')?.1.to_ascii_lowercase();
+            self.defaults.get(&extension).cloned()
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DrawingMarker {
+    row: Option<u32>,
+    column: Option<u32>,
+}
+
+#[derive(Debug, Default)]
+struct DrawingAnchorBuilder {
+    from: DrawingMarker,
+    to: DrawingMarker,
+    two_cell: bool,
+    has_picture: bool,
+    inside_picture: bool,
+    image_relationship_id: Option<String>,
+}
+
+#[derive(Debug)]
+struct DrawingPicture {
+    from: DrawingMarker,
+    to: Option<DrawingMarker>,
+    media_part: String,
+}
+
+#[derive(Debug, Clone)]
+struct MediaAsset {
+    content_type: String,
+    bytes: Vec<u8>,
+    sha256: String,
 }
 
 #[derive(Debug, Default)]
@@ -659,6 +899,9 @@ struct CellBuilder {
     formula_reference: Option<String>,
     shared_formula_index: Option<u32>,
     rich_text: bool,
+    rich_text_runs: Vec<WorkbookRichTextRun>,
+    current_run: Option<WorkbookRichTextRun>,
+    inside_run_properties: bool,
     has_value: bool,
     has_inline: bool,
     has_formula: bool,
@@ -672,8 +915,11 @@ struct SheetScan {
     dimension: Option<String>,
     semantic: Option<SelectionBounds>,
     merged_ranges: Vec<String>,
+    drawing_relationship_ids: Vec<String>,
+    pictures: Vec<WorkbookPicture>,
     hidden_rows: usize,
     hidden_columns: usize,
+    print: WorksheetPrintEvidence,
     cell_elements: usize,
     non_empty_cells: usize,
     style_only_cells: usize,
@@ -783,6 +1029,15 @@ impl<R: Read + Seek> ArchiveReader<R> {
     }
 
     fn read_xml(&mut self, name: &str) -> Result<Option<String>, ReadError> {
+        let Some(bytes) = self.read_bytes(name)? else {
+            return Ok(None);
+        };
+        String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|_| ReadError::InvalidXlsx(format!("OOXML part `{name}` is not UTF-8 XML")))
+    }
+
+    fn read_bytes(&mut self, name: &str) -> Result<Option<Vec<u8>>, ReadError> {
         let mut entry = match self.archive.by_name(name) {
             Ok(entry) => entry,
             Err(ZipError::FileNotFound) => return Ok(None),
@@ -825,9 +1080,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             });
         }
         self.expanded_bytes += bytes.len();
-        String::from_utf8(bytes)
-            .map(Some)
-            .map_err(|_| ReadError::InvalidXlsx(format!("OOXML part `{name}` is not UTF-8 XML")))
+        Ok(Some(bytes))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -958,7 +1211,7 @@ fn read_xlsx_incremental(
         ..WorkbookStatistics::default()
     };
     let mut warnings = result.warnings.clone();
-    let partial_warning = "incremental worksheet refresh is bounded to the cached selections; semantic bounds and worksheet feature inventory are partial";
+    let partial_warning = "incremental worksheet refresh is bounded to the cached selections; later cell bodies and semantic bounds may be partial while worksheet tail features are still scanned";
     if !warnings.iter().any(|warning| warning == partial_warning) {
         warnings.push(partial_warning.to_owned());
     }
@@ -986,6 +1239,18 @@ fn read_xlsx_incremental(
         .map(|selection| selection.cells.len())
         .sum::<usize>();
     let mut remaining_cells = options.spreadsheet.max_cells.saturating_sub(retained_cells);
+    let retained_image_payload_bytes = result
+        .workbook
+        .selections
+        .iter()
+        .filter(|selection| !changed_sheet_names.contains(&selection.sheet))
+        .flat_map(|selection| &selection.images)
+        .filter(|picture| picture.data_uri.is_some())
+        .map(|picture| picture.byte_size)
+        .sum::<usize>();
+    let mut remaining_image_payload_bytes =
+        MAX_TOTAL_IMAGE_PAYLOAD_BYTES.saturating_sub(retained_image_payload_bytes);
+    let mut media_cache = HashMap::new();
     let mut patches = Vec::new();
     for part in changed_worksheet_parts {
         let sheet_index = result
@@ -1008,6 +1273,11 @@ fn read_xlsx_incremental(
             .map(|(global_index, selection)| {
                 let mut selection = selection.clone();
                 selection.cells.clear();
+                selection.used_bounds = None;
+                selection.merged_ranges.clear();
+                selection.images.clear();
+                selection.images_truncated = false;
+                selection.overflow = WorkbookSelectionOverflow::default();
                 selection.truncated = false;
                 (global_index, selection)
             })
@@ -1033,7 +1303,7 @@ fn read_xlsx_incremental(
             .map(|xml| parse_part_relationships(&xml))
             .transpose()?
             .unwrap_or_default();
-        let scan = package.scan_worksheet(
+        let mut scan = package.scan_worksheet(
             part,
             &plans,
             &mut local_selections,
@@ -1045,6 +1315,20 @@ fn read_xlsx_incremental(
             &mut remaining_cells,
             &mut warnings,
         )?;
+        let (pictures, picture_references_truncated) = read_sheet_pictures(
+            &mut package,
+            &sheet_name,
+            part,
+            &scan.drawing_relationship_ids,
+            &relationships,
+            &context.content_types,
+            &mut local_selections,
+            &mut media_cache,
+            &mut remaining_image_payload_bytes,
+            &mut warnings,
+        )?;
+        scan.pictures = pictures;
+        scan.features.feature_references_truncated |= picture_references_truncated;
         statistics.scanned_sheets += 1;
         statistics.cell_elements += scan.cell_elements;
         statistics.non_empty_cells += scan.non_empty_cells;
@@ -1078,10 +1362,12 @@ fn read_xlsx_incremental(
         let sheet = &mut result.workbook.sheets[patch.sheet_index];
         sheet.declared_dimension = patch.scan.dimension;
         sheet.semantic_bounds = patch.scan.semantic.map(format_bounds);
-        sheet.semantic_bounds_complete = patch.scan.features.complete;
+        sheet.semantic_bounds_complete = patch.scan.features.cell_data_complete;
         sheet.merged_ranges = patch.scan.merged_ranges;
+        sheet.pictures = patch.scan.pictures;
         sheet.hidden_rows = patch.scan.hidden_rows;
         sheet.hidden_columns = patch.scan.hidden_columns;
+        apply_worksheet_print_scan(&mut sheet.print, patch.scan.print);
         sheet.features = patch.scan.features;
     }
     statistics.returned_cells = result
@@ -1197,12 +1483,13 @@ fn read_xlsx_with_context(
         .iter()
         .map(|part| (part.name.as_str(), part))
         .collect();
-    let content_types = package.read_required_xml("[Content_Types].xml")?;
-    if !content_types.contains(XLSX_CONTENT_TYPE) {
+    let content_types_xml = package.read_required_xml("[Content_Types].xml")?;
+    if !content_types_xml.contains(XLSX_CONTENT_TYPE) {
         return Err(ReadError::InvalidXlsx(
             "package does not declare an XLSX workbook content type".to_owned(),
         ));
     }
+    let content_types = parse_content_types(&content_types_xml)?;
     let workbook_xml = package.read_required_xml("xl/workbook.xml")?;
     let relationships_xml = package.read_required_xml("xl/_rels/workbook.xml.rels")?;
     let relationships = parse_relationships(&relationships_xml)?;
@@ -1215,16 +1502,22 @@ fn read_xlsx_with_context(
     let (shared_strings, styles) = if options.spreadsheet.revision_only {
         (Vec::new(), Styles::default())
     } else {
-        let shared_strings = package
+        let mut shared_strings = package
             .read_xml("xl/sharedStrings.xml")?
             .map(|xml| parse_shared_strings(&xml))
             .transpose()?
             .unwrap_or_default();
-        let styles = package
+        let mut styles = package
             .read_xml("xl/styles.xml")?
             .map(|xml| parse_styles(&xml))
             .transpose()?
             .unwrap_or_default();
+        let theme = package
+            .read_xml("xl/theme/theme1.xml")?
+            .map(|xml| parse_theme_colors(&xml))
+            .transpose()?
+            .unwrap_or_default();
+        resolve_published_colors(&mut styles, &mut shared_strings, &theme);
         (shared_strings, styles)
     };
     features.rich_string_items = shared_strings.iter().filter(|item| item.rich).count();
@@ -1264,8 +1557,18 @@ fn read_xlsx_with_context(
             semantic_bounds_complete: false,
             selected: plans.iter().any(|plan| plan.sheet_index == index),
             merged_ranges: Vec::new(),
+            pictures: Vec::new(),
             hidden_rows: 0,
             hidden_columns: 0,
+            print: WorksheetPrintEvidence {
+                print_area: print_defined_name(&workbook.defined_names, index, "_xlnm.Print_Area"),
+                print_titles: print_defined_name(
+                    &workbook.defined_names,
+                    index,
+                    "_xlnm.Print_Titles",
+                ),
+                ..WorksheetPrintEvidence::default()
+            },
             features: WorksheetFeatureInventory::default(),
         })
         .collect();
@@ -1275,6 +1578,8 @@ fn read_xlsx_with_context(
     };
     let mut warnings = Vec::new();
     let mut remaining_cells = options.spreadsheet.max_cells;
+    let mut remaining_image_payload_bytes = MAX_TOTAL_IMAGE_PAYLOAD_BYTES;
+    let mut media_cache = HashMap::new();
 
     let mut plans_by_sheet: BTreeMap<usize, Vec<SelectionPlan>> = BTreeMap::new();
     for plan in plans {
@@ -1299,7 +1604,7 @@ fn read_xlsx_with_context(
             .map(|xml| parse_part_relationships(&xml))
             .transpose()?
             .unwrap_or_default();
-        let scan = package.scan_worksheet(
+        let mut scan = package.scan_worksheet(
             &descriptor.path,
             &sheet_plans,
             &mut selections,
@@ -1311,13 +1616,29 @@ fn read_xlsx_with_context(
             &mut remaining_cells,
             &mut warnings,
         )?;
+        let (pictures, picture_references_truncated) = read_sheet_pictures(
+            &mut package,
+            &descriptor.name,
+            &descriptor.path,
+            &scan.drawing_relationship_ids,
+            &sheet_relationships,
+            &content_types,
+            &mut selections,
+            &mut media_cache,
+            &mut remaining_image_payload_bytes,
+            &mut warnings,
+        )?;
+        scan.pictures = pictures;
+        scan.features.feature_references_truncated |= picture_references_truncated;
         let sheet = &mut sheets[sheet_index];
         sheet.declared_dimension = scan.dimension;
         sheet.semantic_bounds = scan.semantic.map(format_bounds);
-        sheet.semantic_bounds_complete = scan.features.complete;
+        sheet.semantic_bounds_complete = scan.features.cell_data_complete;
         sheet.merged_ranges = scan.merged_ranges;
+        sheet.pictures = scan.pictures;
         sheet.hidden_rows = scan.hidden_rows;
         sheet.hidden_columns = scan.hidden_columns;
+        apply_worksheet_print_scan(&mut sheet.print, scan.print);
         sheet.features = scan.features;
         statistics.scanned_sheets += 1;
         statistics.cell_elements += scan.cell_elements;
@@ -1337,12 +1658,13 @@ fn read_xlsx_with_context(
             options.spreadsheet.max_cells
         ));
     }
-    if sheets
-        .iter()
-        .any(|sheet| sheet.features.scanned && !sheet.features.complete)
-    {
+    if sheets.iter().any(|sheet| {
+        sheet.features.scanned
+            && !sheet.features.cell_data_complete
+            && sheet.features.tail_features_complete
+    }) {
         warnings.push(
-            "targeted worksheet scan stopped after the requested rows; semantic bounds and worksheet feature inventory are partial"
+            "targeted worksheet scan skipped cell bodies after the requested rows; semantic bounds and cell statistics are partial, but worksheet tail features were scanned"
                 .to_owned(),
         );
     }
@@ -1403,6 +1725,7 @@ fn read_xlsx_with_context(
         WorkbookSessionContext {
             shared_strings,
             styles,
+            content_types,
         },
     ))
 }
@@ -1465,6 +1788,426 @@ fn parse_part_relationships(xml: &str) -> Result<HashMap<String, PartRelationshi
         }
     }
     Ok(relationships)
+}
+
+fn parse_content_types(xml: &str) -> Result<PackageContentTypes, ReadError> {
+    let mut reader = xml_reader(xml);
+    let mut content_types = PackageContentTypes::default();
+    loop {
+        match reader.read_event().map_err(xml_error)? {
+            Event::Start(element) | Event::Empty(element)
+                if local_name(element.name().as_ref()) == b"Default" =>
+            {
+                let extension = attribute(&element, b"Extension")?
+                    .ok_or_else(|| {
+                        ReadError::InvalidXlsx("content-type default has no Extension".to_owned())
+                    })?
+                    .to_ascii_lowercase();
+                let content_type = attribute(&element, b"ContentType")?.ok_or_else(|| {
+                    ReadError::InvalidXlsx("content-type default has no ContentType".to_owned())
+                })?;
+                content_types.defaults.insert(extension, content_type);
+            }
+            Event::Start(element) | Event::Empty(element)
+                if local_name(element.name().as_ref()) == b"Override" =>
+            {
+                let part = attribute(&element, b"PartName")?
+                    .ok_or_else(|| {
+                        ReadError::InvalidXlsx("content-type override has no PartName".to_owned())
+                    })?
+                    .trim_start_matches('/')
+                    .to_owned();
+                let content_type = attribute(&element, b"ContentType")?.ok_or_else(|| {
+                    ReadError::InvalidXlsx("content-type override has no ContentType".to_owned())
+                })?;
+                content_types.overrides.insert(part, content_type);
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    Ok(content_types)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DrawingMarkerKind {
+    From,
+    To,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DrawingMarkerField {
+    Row,
+    Column,
+}
+
+fn parse_drawing_pictures(
+    xml: &str,
+    drawing_part: &str,
+    relationships: &HashMap<String, PartRelationship>,
+) -> Result<Vec<DrawingPicture>, ReadError> {
+    let mut reader = xml_reader(xml);
+    let mut pictures = Vec::new();
+    let mut anchor: Option<DrawingAnchorBuilder> = None;
+    let mut marker_kind: Option<DrawingMarkerKind> = None;
+    let mut marker_field: Option<DrawingMarkerField> = None;
+    loop {
+        match reader.read_event().map_err(xml_error)? {
+            Event::Start(element)
+                if matches!(
+                    local_name(element.name().as_ref()),
+                    b"twoCellAnchor" | b"oneCellAnchor"
+                ) =>
+            {
+                anchor = Some(DrawingAnchorBuilder {
+                    two_cell: local_name(element.name().as_ref()) == b"twoCellAnchor",
+                    ..DrawingAnchorBuilder::default()
+                });
+            }
+            Event::Start(element)
+                if anchor.is_some() && local_name(element.name().as_ref()) == b"from" =>
+            {
+                marker_kind = Some(DrawingMarkerKind::From);
+            }
+            Event::Start(element)
+                if anchor.is_some() && local_name(element.name().as_ref()) == b"to" =>
+            {
+                marker_kind = Some(DrawingMarkerKind::To);
+            }
+            Event::Start(element)
+                if marker_kind.is_some() && local_name(element.name().as_ref()) == b"row" =>
+            {
+                marker_field = Some(DrawingMarkerField::Row);
+            }
+            Event::Start(element)
+                if marker_kind.is_some() && local_name(element.name().as_ref()) == b"col" =>
+            {
+                marker_field = Some(DrawingMarkerField::Column);
+            }
+            Event::Text(text)
+                if anchor.is_some() && marker_kind.is_some() && marker_field.is_some() =>
+            {
+                let value = text.decode().map_err(encoding_error)?;
+                if let Ok(value) = value.trim().parse::<u32>() {
+                    let marker = match marker_kind.expect("marker kind is checked") {
+                        DrawingMarkerKind::From => {
+                            &mut anchor.as_mut().expect("anchor is checked").from
+                        }
+                        DrawingMarkerKind::To => {
+                            &mut anchor.as_mut().expect("anchor is checked").to
+                        }
+                    };
+                    match marker_field.expect("marker field is checked") {
+                        DrawingMarkerField::Row => marker.row = Some(value),
+                        DrawingMarkerField::Column => marker.column = Some(value),
+                    }
+                }
+            }
+            Event::Start(element)
+                if anchor.is_some() && local_name(element.name().as_ref()) == b"pic" =>
+            {
+                let anchor = anchor.as_mut().expect("anchor is checked");
+                anchor.has_picture = true;
+                anchor.inside_picture = true;
+            }
+            Event::Empty(element)
+                if anchor.is_some() && local_name(element.name().as_ref()) == b"pic" =>
+            {
+                anchor.as_mut().expect("anchor is checked").has_picture = true;
+            }
+            Event::Start(element) | Event::Empty(element)
+                if anchor.as_ref().is_some_and(|anchor| anchor.inside_picture)
+                    && local_name(element.name().as_ref()) == b"blip" =>
+            {
+                if let Some(relationship_id) = attribute_exact(&element, b"r:embed")? {
+                    anchor
+                        .as_mut()
+                        .expect("anchor is checked")
+                        .image_relationship_id = Some(relationship_id);
+                }
+            }
+            Event::End(element)
+                if matches!(local_name(element.name().as_ref()), b"row" | b"col") =>
+            {
+                marker_field = None;
+            }
+            Event::End(element)
+                if matches!(local_name(element.name().as_ref()), b"from" | b"to") =>
+            {
+                marker_kind = None;
+            }
+            Event::End(element) if local_name(element.name().as_ref()) == b"pic" => {
+                if let Some(anchor) = anchor.as_mut() {
+                    anchor.inside_picture = false;
+                }
+            }
+            Event::End(element)
+                if matches!(
+                    local_name(element.name().as_ref()),
+                    b"twoCellAnchor" | b"oneCellAnchor"
+                ) =>
+            {
+                if let Some(anchor) = anchor.take()
+                    && anchor.has_picture
+                    && anchor.from.row.is_some()
+                    && anchor.from.column.is_some()
+                    && (!anchor.two_cell || (anchor.to.row.is_some() && anchor.to.column.is_some()))
+                    && let Some(relationship_id) = anchor.image_relationship_id
+                    && let Some(relationship) = relationships.get(&relationship_id)
+                    && relationship.relationship_type.ends_with("/image")
+                    && !relationship.external
+                {
+                    pictures.push(DrawingPicture {
+                        from: anchor.from,
+                        to: anchor.two_cell.then_some(anchor.to),
+                        media_part: resolve_part_target(drawing_part, &relationship.target)?,
+                    });
+                }
+                marker_kind = None;
+                marker_field = None;
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    Ok(pictures)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_sheet_pictures<R: Read + Seek>(
+    package: &mut ArchiveReader<R>,
+    sheet_name: &str,
+    sheet_part: &str,
+    drawing_relationship_ids: &[String],
+    sheet_relationships: &HashMap<String, PartRelationship>,
+    content_types: &PackageContentTypes,
+    selections: &mut [WorkbookSelection],
+    media_cache: &mut HashMap<String, MediaAsset>,
+    remaining_payload_bytes: &mut usize,
+    warnings: &mut Vec<String>,
+) -> Result<(Vec<WorkbookPicture>, bool), ReadError> {
+    let mut inventory = Vec::new();
+    let mut inventory_truncated = false;
+    for relationship_id in drawing_relationship_ids {
+        let Some(relationship) = sheet_relationships
+            .get(relationship_id)
+            .filter(|relationship| {
+                relationship.relationship_type.ends_with("/drawing") && !relationship.external
+            })
+        else {
+            continue;
+        };
+        let drawing_part = resolve_part_target(sheet_part, &relationship.target)?;
+        let drawing_xml = package.read_required_xml(&drawing_part)?;
+        let drawing_relationships = package
+            .read_xml(&part_relationship_path(&drawing_part)?)?
+            .map(|xml| parse_part_relationships(&xml))
+            .transpose()?
+            .unwrap_or_default();
+        let drawing_pictures =
+            parse_drawing_pictures(&drawing_xml, &drawing_part, &drawing_relationships)?;
+        for drawing_picture in drawing_pictures {
+            let Some(from_cell) = drawing_marker_cell(drawing_picture.from) else {
+                push_unique_warning(
+                    warnings,
+                    format!("worksheet `{sheet_name}` has a picture with an invalid from marker"),
+                );
+                continue;
+            };
+            let to_cell = drawing_picture.to.and_then(drawing_marker_cell);
+            let inventory_slot = inventory.len() < MAX_IMAGE_REFERENCES;
+            if !inventory_slot {
+                inventory_truncated = true;
+            }
+            let mut selection_indexes = Vec::new();
+            for (index, selection) in selections.iter_mut().enumerate() {
+                if selection.sheet != sheet_name
+                    || !drawing_picture_intersects_selection(&drawing_picture, selection.bounds)
+                {
+                    continue;
+                }
+                if selection.images.len() >= MAX_IMAGE_REFERENCES {
+                    selection.images_truncated = true;
+                    push_unique_warning(
+                        warnings,
+                        format!(
+                            "worksheet image inventory was truncated at {MAX_IMAGE_REFERENCES} pictures per selection"
+                        ),
+                    );
+                } else {
+                    selection_indexes.push(index);
+                }
+            }
+            if !inventory_slot && selection_indexes.is_empty() {
+                continue;
+            }
+            if !media_cache.contains_key(&drawing_picture.media_part) {
+                let bytes = package
+                    .read_bytes(&drawing_picture.media_part)?
+                    .ok_or_else(|| {
+                        ReadError::InvalidXlsx(format!(
+                            "drawing image part `{}` is missing",
+                            drawing_picture.media_part
+                        ))
+                    })?;
+                let content_type = content_types
+                    .for_part(&drawing_picture.media_part)
+                    .unwrap_or_else(|| "application/octet-stream".to_owned());
+                let sha256 = hex_lower(digest(&SHA256, &bytes).as_ref());
+                media_cache.insert(
+                    drawing_picture.media_part.clone(),
+                    MediaAsset {
+                        content_type,
+                        bytes,
+                        sha256,
+                    },
+                );
+            }
+            let asset = media_cache
+                .get(&drawing_picture.media_part)
+                .expect("media asset was inserted");
+            let picture = WorkbookPicture {
+                sheet: sheet_name.to_owned(),
+                from_cell,
+                to_cell,
+                from_row_index: drawing_picture.from.row.unwrap_or_default(),
+                from_column_index: drawing_picture.from.column.unwrap_or_default(),
+                to_row_index: drawing_picture.to.and_then(|marker| marker.row),
+                to_column_index: drawing_picture.to.and_then(|marker| marker.column),
+                media_part: drawing_picture.media_part,
+                content_type: asset.content_type.clone(),
+                byte_size: asset.bytes.len(),
+                sha256: asset.sha256.clone(),
+                data_uri: None,
+                payload_truncated: false,
+            };
+            if inventory_slot {
+                inventory.push(picture.clone());
+            }
+            for index in selection_indexes {
+                let selection = &mut selections[index];
+                let mut selected_picture = picture.clone();
+                if asset.bytes.len() <= MAX_IMAGE_PAYLOAD_BYTES
+                    && asset.bytes.len() <= *remaining_payload_bytes
+                {
+                    selected_picture.data_uri = Some(format!(
+                        "data:{};base64,{}",
+                        asset.content_type,
+                        encode_base64(&asset.bytes)
+                    ));
+                    *remaining_payload_bytes -= asset.bytes.len();
+                } else {
+                    selected_picture.payload_truncated = true;
+                    selection.images_truncated = true;
+                    push_unique_warning(
+                        warnings,
+                        format!(
+                            "worksheet image payloads are limited to {MAX_IMAGE_PAYLOAD_BYTES} bytes per image and {MAX_TOTAL_IMAGE_PAYLOAD_BYTES} bytes total; omitted payloads remain available as metadata"
+                        ),
+                    );
+                }
+                selection.images.push(selected_picture);
+            }
+        }
+    }
+    if inventory_truncated {
+        push_unique_warning(
+            warnings,
+            format!(
+                "worksheet picture inventory was truncated at {MAX_IMAGE_REFERENCES} pictures per scanned sheet"
+            ),
+        );
+    }
+    Ok((inventory, inventory_truncated))
+}
+
+fn drawing_marker_cell(marker: DrawingMarker) -> Option<String> {
+    let row = marker.row?.checked_add(1)?;
+    let column = marker.column?.checked_add(1)?;
+    if row > 1_048_576 || column > 16_384 {
+        return None;
+    }
+    Some(format!(
+        "{}{}",
+        column_name(u16::try_from(column).ok()?),
+        row
+    ))
+}
+
+fn drawing_picture_intersects_selection(picture: &DrawingPicture, bounds: SelectionBounds) -> bool {
+    drawing_anchor_intersects_selection(picture.from, picture.to, bounds)
+}
+
+fn drawing_anchor_intersects_selection(
+    from: DrawingMarker,
+    to: Option<DrawingMarker>,
+    bounds: SelectionBounds,
+) -> bool {
+    let Some(from_row) = from.row.map(|value| value.saturating_add(1)) else {
+        return false;
+    };
+    let Some(from_column) = from.column.map(|value| value.saturating_add(1)) else {
+        return false;
+    };
+    let to_row = to
+        .and_then(|marker| marker.row)
+        .unwrap_or(from_row - 1)
+        .saturating_add(1);
+    let to_column = to
+        .and_then(|marker| marker.column)
+        .unwrap_or(from_column - 1)
+        .saturating_add(1);
+    let start_row = from_row.min(to_row);
+    let end_row = from_row.max(to_row);
+    let start_column = from_column.min(to_column);
+    let end_column = from_column.max(to_column);
+    start_row <= bounds.end_row
+        && end_row >= bounds.start_row
+        && start_column <= u32::from(bounds.end_column)
+        && end_column >= u32::from(bounds.start_column)
+}
+
+fn encode_base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        output.push(char::from(TABLE[usize::from(first >> 2)]));
+        output.push(char::from(
+            TABLE[usize::from(((first & 0x03) << 4) | (second >> 4))],
+        ));
+        if chunk.len() > 1 {
+            output.push(char::from(
+                TABLE[usize::from(((second & 0x0f) << 2) | (third >> 6))],
+            ));
+        } else {
+            output.push('=');
+        }
+        if chunk.len() > 2 {
+            output.push(char::from(TABLE[usize::from(third & 0x3f)]));
+        } else {
+            output.push('=');
+        }
+    }
+    output
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
+}
+
+fn push_unique_warning(warnings: &mut Vec<String>, warning: String) {
+    if !warnings.iter().any(|existing| existing == &warning) {
+        warnings.push(warning);
+    }
 }
 
 fn parse_workbook(
@@ -1549,11 +2292,35 @@ fn parse_workbook(
     })
 }
 
+fn print_defined_name(
+    defined_names: &[DefinedName],
+    sheet_index: usize,
+    name: &str,
+) -> Option<String> {
+    defined_names
+        .iter()
+        .find(|defined_name| {
+            defined_name.name == name && defined_name.local_sheet_index == Some(sheet_index)
+        })
+        .map(|defined_name| defined_name.reference.clone())
+}
+
+fn apply_worksheet_print_scan(target: &mut WorksheetPrintEvidence, scan: WorksheetPrintEvidence) {
+    target.page_setup = scan.page_setup;
+    target.print_options = scan.print_options;
+    target.row_breaks = scan.row_breaks;
+    target.column_breaks = scan.column_breaks;
+    target.header_footer = scan.header_footer;
+}
+
 fn parse_shared_strings(xml: &str) -> Result<Vec<SharedString>, ReadError> {
     let mut reader = xml_reader(xml);
     let mut strings = Vec::new();
     let mut current: Option<String> = None;
     let mut rich = false;
+    let mut runs = Vec::new();
+    let mut run: Option<WorkbookRichTextRun> = None;
+    let mut inside_run_properties = false;
     let mut inside_text = false;
     let mut phonetic_depth = 0usize;
     loop {
@@ -1561,10 +2328,33 @@ fn parse_shared_strings(xml: &str) -> Result<Vec<SharedString>, ReadError> {
             Event::Start(element) if local_name(element.name().as_ref()) == b"si" => {
                 current = Some(String::new());
                 rich = false;
+                runs.clear();
             }
             Event::Start(element) if local_name(element.name().as_ref()) == b"r" => {
                 if current.is_some() {
                     rich = true;
+                    run = Some(WorkbookRichTextRun::default());
+                }
+            }
+            Event::Start(element) if local_name(element.name().as_ref()) == b"rPr" => {
+                inside_run_properties = true;
+            }
+            Event::Start(element) | Event::Empty(element)
+                if inside_run_properties && local_name(element.name().as_ref()) == b"strike" =>
+            {
+                if let Some(run) = run.as_mut() {
+                    run.strike = Some(
+                        attribute(&element, b"val")?
+                            .as_deref()
+                            .is_none_or(xml_truthy),
+                    );
+                }
+            }
+            Event::Start(element) | Event::Empty(element)
+                if inside_run_properties && local_name(element.name().as_ref()) == b"color" =>
+            {
+                if let Some(run) = run.as_mut() {
+                    run.font_color = parse_font_color(&element)?;
                 }
             }
             Event::Start(element) if local_name(element.name().as_ref()) == b"rPh" => {
@@ -1577,12 +2367,27 @@ fn parse_shared_strings(xml: &str) -> Result<Vec<SharedString>, ReadError> {
             }
             Event::Text(text) if inside_text => {
                 if let Some(value) = current.as_mut() {
-                    push_bounded(value, &text.decode().map_err(encoding_error)?);
+                    let decoded = text.decode().map_err(encoding_error)?;
+                    push_bounded(value, &decoded);
+                    if let Some(run) = run.as_mut() {
+                        push_bounded(&mut run.text, &decoded);
+                    }
                 }
             }
             Event::GeneralRef(entity) if inside_text => {
                 if let Some(value) = current.as_mut() {
                     push_bounded(value, &decode_reference(&entity)?);
+                    if let Some(run) = run.as_mut() {
+                        push_bounded(&mut run.text, &decode_reference(&entity)?);
+                    }
+                }
+            }
+            Event::End(element) if local_name(element.name().as_ref()) == b"rPr" => {
+                inside_run_properties = false;
+            }
+            Event::End(element) if local_name(element.name().as_ref()) == b"r" => {
+                if let Some(run) = run.take() {
+                    runs.push(run);
                 }
             }
             Event::End(element) if local_name(element.name().as_ref()) == b"t" => {
@@ -1595,6 +2400,7 @@ fn parse_shared_strings(xml: &str) -> Result<Vec<SharedString>, ReadError> {
                 strings.push(SharedString {
                     text: current.take().unwrap_or_default(),
                     rich,
+                    runs: std::mem::take(&mut runs),
                 });
             }
             Event::Eof => break,
@@ -1608,6 +2414,8 @@ fn parse_styles(xml: &str) -> Result<Styles, ReadError> {
     let mut reader = xml_reader(xml);
     let mut styles = Styles::default();
     let mut inside_cell_xfs = false;
+    let mut inside_fonts = false;
+    let mut font: Option<FontFormat> = None;
     loop {
         match reader.read_event().map_err(xml_error)? {
             Event::Start(element) | Event::Empty(element)
@@ -1623,6 +2431,41 @@ fn parse_styles(xml: &str) -> Result<Styles, ReadError> {
             Event::Start(element) if local_name(element.name().as_ref()) == b"cellXfs" => {
                 inside_cell_xfs = true;
             }
+            Event::Start(element) if local_name(element.name().as_ref()) == b"fonts" => {
+                inside_fonts = true;
+            }
+            Event::End(element) if local_name(element.name().as_ref()) == b"fonts" => {
+                inside_fonts = false;
+            }
+            Event::Start(element)
+                if inside_fonts && local_name(element.name().as_ref()) == b"font" =>
+            {
+                font = Some(FontFormat::default());
+            }
+            Event::Empty(element)
+                if inside_fonts && local_name(element.name().as_ref()) == b"font" =>
+            {
+                styles.fonts.push(FontFormat::default());
+            }
+            Event::Start(element) | Event::Empty(element)
+                if font.is_some() && local_name(element.name().as_ref()) == b"strike" =>
+            {
+                font.as_mut().unwrap().strike = Some(
+                    attribute(&element, b"val")?
+                        .as_deref()
+                        .is_none_or(xml_truthy),
+                );
+            }
+            Event::Start(element) | Event::Empty(element)
+                if font.is_some() && local_name(element.name().as_ref()) == b"color" =>
+            {
+                font.as_mut().unwrap().color = parse_font_color(&element)?;
+            }
+            Event::End(element) if local_name(element.name().as_ref()) == b"font" => {
+                if let Some(font) = font.take() {
+                    styles.fonts.push(font);
+                }
+            }
             Event::End(element) if local_name(element.name().as_ref()) == b"cellXfs" => {
                 inside_cell_xfs = false;
             }
@@ -1633,12 +2476,207 @@ fn parse_styles(xml: &str) -> Result<Styles, ReadError> {
                     .and_then(|value| value.parse().ok())
                     .unwrap_or(0);
                 styles.cell_formats.push(id);
+                let apply_font = attribute(&element, b"applyFont")?
+                    .as_deref()
+                    .map(xml_truthy);
+                let font_index =
+                    attribute(&element, b"fontId")?.and_then(|value| value.parse().ok());
+                styles
+                    .cell_font_indexes
+                    .push((apply_font != Some(false)).then_some(font_index).flatten());
             }
             Event::Eof => break,
             _ => {}
         }
     }
     Ok(styles)
+}
+
+fn parse_font_color(element: &BytesStart<'_>) -> Result<Option<WorkbookFontColor>, ReadError> {
+    let color = WorkbookFontColor {
+        rgb: attribute(element, b"rgb")?.map(|value| value.to_ascii_uppercase()),
+        theme: attribute(element, b"theme")?.and_then(|value| value.parse().ok()),
+        indexed: attribute(element, b"indexed")?.and_then(|value| value.parse().ok()),
+        auto: attribute(element, b"auto")?.as_deref().map(xml_truthy),
+        tint: attribute(element, b"tint")?.and_then(|value| value.parse().ok()),
+        resolved_rgb: None,
+    };
+    Ok((color.rgb.is_some()
+        || color.theme.is_some()
+        || color.indexed.is_some()
+        || color.auto.is_some()
+        || color.tint.is_some())
+    .then_some(color))
+}
+
+fn parse_theme_colors(xml: &str) -> Result<Vec<Option<String>>, ReadError> {
+    let mut reader = xml_reader(xml);
+    let mut colors = vec![None; 12];
+    let mut inside_scheme = false;
+    let mut slot = None;
+    loop {
+        match reader.read_event().map_err(xml_error)? {
+            Event::Start(element) if local_name(element.name().as_ref()) == b"clrScheme" => {
+                inside_scheme = true;
+            }
+            Event::End(element) if local_name(element.name().as_ref()) == b"clrScheme" => break,
+            Event::Start(element) if inside_scheme && slot.is_none() => {
+                slot = theme_color_index(local_name(element.name().as_ref()));
+            }
+            Event::Start(element) | Event::Empty(element)
+                if inside_scheme
+                    && slot.is_some()
+                    && matches!(local_name(element.name().as_ref()), b"srgbClr" | b"sysClr") =>
+            {
+                let value = if local_name(element.name().as_ref()) == b"sysClr" {
+                    attribute(&element, b"val")?
+                        .filter(|value| is_rgb_hex(value))
+                        .or(attribute(&element, b"lastClr")?)
+                } else {
+                    attribute(&element, b"val")?
+                };
+                if let (Some(index), Some(value)) = (slot, value) {
+                    colors[index] = Some(value.to_ascii_uppercase());
+                }
+            }
+            Event::End(element)
+                if inside_scheme
+                    && theme_color_index(local_name(element.name().as_ref())).is_some() =>
+            {
+                slot = None;
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    Ok(colors)
+}
+
+fn theme_color_index(name: &[u8]) -> Option<usize> {
+    match name {
+        // SpreadsheetML theme indexes deliberately swap the first two pairs
+        // from DrawingML clrScheme order: 0=lt1, 1=dk1, 2=lt2, 3=dk2.
+        b"lt1" => Some(0),
+        b"dk1" => Some(1),
+        b"lt2" => Some(2),
+        b"dk2" => Some(3),
+        b"accent1" => Some(4),
+        b"accent2" => Some(5),
+        b"accent3" => Some(6),
+        b"accent4" => Some(7),
+        b"accent5" => Some(8),
+        b"accent6" => Some(9),
+        b"hlink" => Some(10),
+        b"folHlink" => Some(11),
+        _ => None,
+    }
+}
+
+fn is_rgb_hex(value: &str) -> bool {
+    value.len() == 6 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn resolve_published_colors(
+    styles: &mut Styles,
+    shared_strings: &mut [SharedString],
+    theme: &[Option<String>],
+) {
+    styles.theme = theme.to_vec();
+    for font in &mut styles.fonts {
+        if let Some(color) = &mut font.color {
+            color.resolved_rgb = resolve_color(color, theme);
+        }
+    }
+    for item in shared_strings {
+        for run in &mut item.runs {
+            if let Some(color) = &mut run.font_color {
+                color.resolved_rgb = resolve_color(color, theme);
+            }
+        }
+    }
+}
+
+fn resolve_color(color: &WorkbookFontColor, theme: &[Option<String>]) -> Option<String> {
+    if color.auto == Some(true) {
+        return None;
+    }
+    let base = if let Some(rgb) = &color.rgb {
+        (rgb.len() >= 6).then(|| rgb[rgb.len() - 6..].to_ascii_uppercase())
+    } else if let Some(index) = color.theme {
+        theme.get(index as usize).cloned().flatten()
+    } else if let Some(index) = color.indexed {
+        indexed_color(index).map(str::to_owned)
+    } else {
+        None
+    }?;
+    apply_tint(&base, color.tint.unwrap_or(0.0))
+}
+
+fn indexed_color(index: u32) -> Option<&'static str> {
+    const COLORS: [&str; 64] = [
+        "000000", "FFFFFF", "FF0000", "00FF00", "0000FF", "FFFF00", "FF00FF", "00FFFF", "000000",
+        "FFFFFF", "FF0000", "00FF00", "0000FF", "FFFF00", "FF00FF", "00FFFF", "800000", "008000",
+        "000080", "808000", "800080", "008080", "C0C0C0", "808080", "9999FF", "993366", "FFFFCC",
+        "CCFFFF", "660066", "FF8080", "0066CC", "CCCCFF", "000080", "FF00FF", "FFFF00", "00FFFF",
+        "800080", "800000", "008080", "0000FF", "00CCFF", "CCFFFF", "CCFFCC", "FFFF99", "99CCFF",
+        "FF99CC", "CC99FF", "FFCC99", "3366FF", "33CCCC", "99CC00", "FFCC00", "FF9900", "FF6600",
+        "666699", "969696", "003366", "339966", "003300", "333300", "993300", "993366", "333399",
+        "333333",
+    ];
+    COLORS.get(index as usize).copied()
+}
+
+fn apply_tint(rgb: &str, tint: f64) -> Option<String> {
+    if rgb.len() != 6 || !(-1.0..=1.0).contains(&tint) {
+        return None;
+    }
+    let r = u8::from_str_radix(&rgb[0..2], 16).ok()? as f64 / 255.0;
+    let g = u8::from_str_radix(&rgb[2..4], 16).ok()? as f64 / 255.0;
+    let b = u8::from_str_radix(&rgb[4..6], 16).ok()? as f64 / 255.0;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let mut h = 0.0;
+    let l = (max + min) / 2.0;
+    let d = max - min;
+    let s = if d == 0.0 {
+        0.0
+    } else {
+        d / (1.0 - (2.0 * l - 1.0).abs())
+    };
+    if d != 0.0 {
+        h = if max == r {
+            ((g - b) / d) % 6.0
+        } else if max == g {
+            (b - r) / d + 2.0
+        } else {
+            (r - g) / d + 4.0
+        } / 6.0;
+        if h < 0.0 {
+            h += 1.0;
+        }
+    }
+    let l = if tint < 0.0 {
+        l * (1.0 + tint)
+    } else {
+        l * (1.0 - tint) + tint
+    };
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = c * (1.0 - (((h * 6.0) % 2.0) - 1.0).abs());
+    let m = l - c / 2.0;
+    let (r1, g1, b1) = match (h * 6.0).floor() as i32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    Some(format!(
+        "{:02X}{:02X}{:02X}",
+        ((r1 + m) * 255.0).round() as u8,
+        ((g1 + m) * 255.0).round() as u8,
+        ((b1 + m) * 255.0).round() as u8
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1659,12 +2697,14 @@ fn parse_worksheet<R: BufRead>(
     let mut buffer = Vec::new();
     let mut scan = SheetScan::default();
     scan.features.scanned = true;
-    scan.features.complete = true;
+    scan.features.cell_data_complete = true;
     let mut cell: Option<CellBuilder> = None;
-    let allow_early_stop = !options.ranges.is_empty();
+    let allow_cell_skip = !options.ranges.is_empty();
     let max_requested_row = plans.iter().map(|plan| plan.bounds.end_row).max();
-    let mut declared_end_row = None;
-    let mut current_row: Option<u32> = None;
+    let mut selection_extents = vec![None; selections.len()];
+    let mut inside_sheet_data = false;
+    let mut inside_row_breaks = false;
+    let mut inside_column_breaks = false;
     let mut phonetic_depth = 0usize;
     loop {
         match reader.read_event_into(&mut buffer).map_err(xml_error)? {
@@ -1715,6 +2755,38 @@ fn parse_worksheet<R: BufRead>(
                     && cell.cell_type.as_deref() == Some("inlineStr")
                 {
                     cell.rich_text = true;
+                    cell.current_run = Some(WorkbookRichTextRun::default());
+                }
+            }
+            Event::Start(element) if local_name(element.name().as_ref()) == b"rPr" => {
+                if let Some(cell) = cell.as_mut()
+                    && cell.current_run.is_some()
+                {
+                    cell.inside_run_properties = true;
+                }
+            }
+            Event::Start(element) | Event::Empty(element)
+                if local_name(element.name().as_ref()) == b"strike" =>
+            {
+                if let Some(cell) = cell.as_mut()
+                    && cell.inside_run_properties
+                    && let Some(run) = cell.current_run.as_mut()
+                {
+                    run.strike = Some(
+                        attribute(&element, b"val")?
+                            .as_deref()
+                            .is_none_or(xml_truthy),
+                    );
+                }
+            }
+            Event::Start(element) | Event::Empty(element)
+                if local_name(element.name().as_ref()) == b"color" =>
+            {
+                if let Some(cell) = cell.as_mut()
+                    && cell.inside_run_properties
+                    && let Some(run) = cell.current_run.as_mut()
+                {
+                    run.font_color = parse_font_color(&element)?;
                 }
             }
             Event::Start(element) if local_name(element.name().as_ref()) == b"rPh" => {
@@ -1729,6 +2801,9 @@ fn parse_worksheet<R: BufRead>(
                         push_bounded(&mut cell.formula, &text);
                     } else if cell.capture_inline_text {
                         push_bounded(&mut cell.inline, &text);
+                        if let Some(run) = cell.current_run.as_mut() {
+                            push_bounded(&mut run.text, &text);
+                        }
                     }
                 }
             }
@@ -1741,6 +2816,9 @@ fn parse_worksheet<R: BufRead>(
                         push_bounded(&mut cell.formula, &text);
                     } else if cell.capture_inline_text {
                         push_bounded(&mut cell.inline, &text);
+                        if let Some(run) = cell.current_run.as_mut() {
+                            push_bounded(&mut run.text, &text);
+                        }
                     }
                 }
             }
@@ -1762,6 +2840,18 @@ fn parse_worksheet<R: BufRead>(
             Event::End(element) if local_name(element.name().as_ref()) == b"rPh" => {
                 phonetic_depth = phonetic_depth.saturating_sub(1);
             }
+            Event::End(element) if local_name(element.name().as_ref()) == b"rPr" => {
+                if let Some(cell) = cell.as_mut() {
+                    cell.inside_run_properties = false;
+                }
+            }
+            Event::End(element) if local_name(element.name().as_ref()) == b"r" => {
+                if let Some(cell) = cell.as_mut()
+                    && let Some(run) = cell.current_run.take()
+                {
+                    cell.rich_text_runs.push(run);
+                }
+            }
             Event::End(element) if local_name(element.name().as_ref()) == b"c" => {
                 if let Some(builder) = cell.take() {
                     if let Some(parsed) = finish_cell(
@@ -1775,6 +2865,13 @@ fn parse_worksheet<R: BufRead>(
                         scan.non_empty_cells += 1;
                         update_semantic_bounds(&mut scan.semantic, parsed.row, parsed.column);
                         for plan in plans {
+                            record_selection_extent(
+                                &mut selection_extents[plan.output_index],
+                                &mut selections[plan.output_index].overflow,
+                                plan.bounds,
+                                parsed.row,
+                                parsed.column,
+                            );
                             if contains(plan.bounds, parsed.row, parsed.column) {
                                 let selection = &mut selections[plan.output_index];
                                 if *remaining_cells > 0 {
@@ -1794,12 +2891,6 @@ fn parse_worksheet<R: BufRead>(
                 if local_name(element.name().as_ref()) == b"dimension" =>
             {
                 scan.dimension = attribute(&element, b"ref")?;
-                declared_end_row = scan.dimension.as_deref().and_then(|dimension| {
-                    dimension.rsplit_once(':').map_or_else(
-                        || parse_cell_reference(dimension).map(|(row, _)| row),
-                        |(_, end)| parse_cell_reference(end).map(|(row, _)| row),
-                    )
-                });
             }
             Event::Start(element) | Event::Empty(element)
                 if local_name(element.name().as_ref()) == b"mergeCell" =>
@@ -1808,33 +2899,28 @@ fn parse_worksheet<R: BufRead>(
                     scan.merged_ranges.push(reference);
                 }
             }
-            Event::Start(element) | Event::Empty(element)
-                if local_name(element.name().as_ref()) == b"row" =>
-            {
-                current_row = attribute(&element, b"r")?.and_then(|value| value.parse().ok());
-                if allow_early_stop
-                    && let (Some(row), Some(max_row), Some(sheet_end_row)) =
-                        (current_row, max_requested_row, declared_end_row)
+            Event::Start(element) if local_name(element.name().as_ref()) == b"sheetData" => {
+                inside_sheet_data = true;
+            }
+            Event::End(element) if local_name(element.name().as_ref()) == b"sheetData" => {
+                inside_sheet_data = false;
+            }
+            Event::Start(element) if local_name(element.name().as_ref()) == b"row" => {
+                let row = record_row_metadata(&element, &mut scan)?;
+                if inside_sheet_data
+                    && allow_cell_skip
+                    && let (Some(row), Some(max_row)) = (row, max_requested_row)
                     && row > max_row
-                    && sheet_end_row > max_row
                 {
-                    scan.features.complete = false;
-                    break;
+                    scan.features.cell_data_complete = false;
+                    let mut skipped = Vec::new();
+                    reader
+                        .read_to_end_into(element.name(), &mut skipped)
+                        .map_err(xml_error)?;
                 }
-                if attribute(&element, b"hidden")?
-                    .as_deref()
-                    .is_some_and(xml_truthy)
-                {
-                    scan.hidden_rows += 1;
-                }
-                let outline_level = attribute(&element, b"outlineLevel")?
-                    .and_then(|value| value.parse::<u8>().ok())
-                    .unwrap_or(0);
-                if outline_level > 0 {
-                    scan.features.outlined_rows += 1;
-                    scan.features.max_row_outline_level =
-                        scan.features.max_row_outline_level.max(outline_level);
-                }
+            }
+            Event::Empty(element) if local_name(element.name().as_ref()) == b"row" => {
+                record_row_metadata(&element, &mut scan)?;
             }
             Event::Start(element) | Event::Empty(element)
                 if local_name(element.name().as_ref()) == b"col" =>
@@ -1927,6 +3013,13 @@ fn parse_worksheet<R: BufRead>(
                 if local_name(element.name().as_ref()) == b"drawing" =>
             {
                 scan.features.drawing_parts += 1;
+                if let Some(relationship_id) = attribute_exact(&element, b"r:id")? {
+                    push_feature_reference(
+                        &mut scan.drawing_relationship_ids,
+                        relationship_id,
+                        &mut scan.features.feature_references_truncated,
+                    );
+                }
             }
             Event::Start(element) | Event::Empty(element)
                 if local_name(element.name().as_ref()) == b"legacyDrawing" =>
@@ -1934,10 +3027,45 @@ fn parse_worksheet<R: BufRead>(
                 scan.features.comment_drawing_parts += 1;
             }
             Event::Start(element) | Event::Empty(element)
-                if matches!(
-                    local_name(element.name().as_ref()),
-                    b"pageSetup" | b"pageMargins" | b"printOptions"
-                ) =>
+                if local_name(element.name().as_ref()) == b"pageSetUpPr" =>
+            {
+                scan.features.page_setup = true;
+                let page_setup = scan.print.page_setup.get_or_insert_default();
+                page_setup.fit_to_page = attribute(&element, b"fitToPage")?
+                    .as_deref()
+                    .map(xml_truthy);
+            }
+            Event::Start(element) | Event::Empty(element)
+                if local_name(element.name().as_ref()) == b"pageSetup" =>
+            {
+                scan.features.page_setup = true;
+                let page_setup = scan.print.page_setup.get_or_insert_default();
+                page_setup.orientation = attribute(&element, b"orientation")?;
+                page_setup.paper_size =
+                    attribute(&element, b"paperSize")?.and_then(|value| value.parse().ok());
+                if let Some(value) = attribute(&element, b"fitToPage")? {
+                    page_setup.fit_to_page = Some(xml_truthy(&value));
+                }
+                page_setup.fit_to_width =
+                    attribute(&element, b"fitToWidth")?.and_then(|value| value.parse().ok());
+                page_setup.fit_to_height =
+                    attribute(&element, b"fitToHeight")?.and_then(|value| value.parse().ok());
+                page_setup.scale =
+                    attribute(&element, b"scale")?.and_then(|value| value.parse().ok());
+            }
+            Event::Start(element) | Event::Empty(element)
+                if local_name(element.name().as_ref()) == b"printOptions" =>
+            {
+                scan.features.page_setup = true;
+                scan.print.print_options = Some(WorksheetPrintOptions {
+                    grid_lines: attribute(&element, b"gridLines")?
+                        .as_deref()
+                        .map(xml_truthy),
+                    headings: attribute(&element, b"headings")?.as_deref().map(xml_truthy),
+                });
+            }
+            Event::Start(element) | Event::Empty(element)
+                if local_name(element.name().as_ref()) == b"pageMargins" =>
             {
                 scan.features.page_setup = true;
             }
@@ -1945,6 +3073,40 @@ fn parse_worksheet<R: BufRead>(
                 if local_name(element.name().as_ref()) == b"headerFooter" =>
             {
                 scan.features.header_footer = true;
+                scan.print.header_footer = true;
+            }
+            Event::Start(element) if local_name(element.name().as_ref()) == b"rowBreaks" => {
+                inside_row_breaks = true;
+            }
+            Event::End(element) if local_name(element.name().as_ref()) == b"rowBreaks" => {
+                inside_row_breaks = false;
+            }
+            Event::Start(element) if local_name(element.name().as_ref()) == b"colBreaks" => {
+                inside_column_breaks = true;
+            }
+            Event::End(element) if local_name(element.name().as_ref()) == b"colBreaks" => {
+                inside_column_breaks = false;
+            }
+            Event::Start(element) | Event::Empty(element)
+                if local_name(element.name().as_ref()) == b"brk" =>
+            {
+                if let Some(reference) =
+                    attribute(&element, b"id")?.and_then(|value| value.parse::<u32>().ok())
+                {
+                    if inside_row_breaks {
+                        push_feature_reference(
+                            &mut scan.print.row_breaks,
+                            reference,
+                            &mut scan.features.feature_references_truncated,
+                        );
+                    } else if inside_column_breaks {
+                        push_feature_reference(
+                            &mut scan.print.column_breaks,
+                            reference,
+                            &mut scan.features.feature_references_truncated,
+                        );
+                    }
+                }
             }
             Event::Start(element) | Event::Empty(element)
                 if local_name(element.name().as_ref()) == b"sparkline" =>
@@ -1956,24 +3118,232 @@ fn parse_worksheet<R: BufRead>(
             {
                 scan.features.controls += 1;
             }
-            Event::End(element) if local_name(element.name().as_ref()) == b"row" => {
-                if allow_early_stop
-                    && let (Some(row), Some(max_row), Some(sheet_end_row)) =
-                        (current_row, max_requested_row, declared_end_row)
-                    && row >= max_row
-                    && sheet_end_row > max_row
-                {
-                    scan.features.complete = false;
-                    break;
-                }
-                current_row = None;
+            Event::Eof => {
+                scan.features.tail_features_complete = true;
+                break;
             }
-            Event::Eof => break,
             _ => {}
         }
         buffer.clear();
     }
+    scan.features.complete =
+        scan.features.cell_data_complete && scan.features.tail_features_complete;
+    for plan in plans {
+        selections[plan.output_index].used_bounds =
+            selection_extents[plan.output_index].map(format_bounds);
+    }
+    publish_selection_merges(plans, selections, &scan.merged_ranges, remaining_cells);
     Ok(scan)
+}
+
+fn record_row_metadata(
+    element: &BytesStart<'_>,
+    scan: &mut SheetScan,
+) -> Result<Option<u32>, ReadError> {
+    let row = attribute(element, b"r")?.and_then(|value| value.parse().ok());
+    if attribute(element, b"hidden")?
+        .as_deref()
+        .is_some_and(xml_truthy)
+    {
+        scan.hidden_rows += 1;
+    }
+    let outline_level = attribute(element, b"outlineLevel")?
+        .and_then(|value| value.parse::<u8>().ok())
+        .unwrap_or(0);
+    if outline_level > 0 {
+        scan.features.outlined_rows += 1;
+        scan.features.max_row_outline_level =
+            scan.features.max_row_outline_level.max(outline_level);
+    }
+    Ok(row)
+}
+
+fn record_selection_extent(
+    used_bounds: &mut Option<SelectionBounds>,
+    overflow: &mut WorkbookSelectionOverflow,
+    requested: SelectionBounds,
+    row: u32,
+    column: u16,
+) {
+    if (requested.start_row..=requested.end_row).contains(&row) {
+        update_semantic_bounds(used_bounds, row, column);
+        if column < requested.start_column {
+            update_column_overflow(&mut overflow.left, column);
+        } else if column > requested.end_column {
+            update_column_overflow(&mut overflow.right, column);
+        }
+    } else if (requested.start_column..=requested.end_column).contains(&column) {
+        if row < requested.start_row {
+            update_row_overflow(&mut overflow.above, row);
+        } else if row > requested.end_row {
+            update_row_overflow(&mut overflow.below, row);
+        }
+    }
+}
+
+fn update_column_overflow(overflow: &mut Option<WorkbookColumnOverflow>, column: u16) {
+    if let Some(overflow) = overflow {
+        overflow.min_column = overflow.min_column.min(column);
+        overflow.max_column = overflow.max_column.max(column);
+        overflow.cell_count += 1;
+    } else {
+        *overflow = Some(WorkbookColumnOverflow {
+            min_column: column,
+            max_column: column,
+            cell_count: 1,
+        });
+    }
+}
+
+fn update_row_overflow(overflow: &mut Option<WorkbookRowOverflow>, row: u32) {
+    if let Some(overflow) = overflow {
+        overflow.min_row = overflow.min_row.min(row);
+        overflow.max_row = overflow.max_row.max(row);
+        overflow.cell_count += 1;
+    } else {
+        *overflow = Some(WorkbookRowOverflow {
+            min_row: row,
+            max_row: row,
+            cell_count: 1,
+        });
+    }
+}
+
+fn publish_selection_merges(
+    plans: &[SelectionPlan],
+    selections: &mut [WorkbookSelection],
+    merged_ranges: &[String],
+    remaining_cells: &mut usize,
+) {
+    let parsed_merges = merged_ranges
+        .iter()
+        .filter_map(|reference| parse_range_reference(reference).map(|bounds| (reference, bounds)))
+        .collect::<Vec<_>>();
+    for plan in plans {
+        let selection = &mut selections[plan.output_index];
+        let intersecting = parsed_merges
+            .iter()
+            .filter(|(_, bounds)| bounds_intersect(plan.bounds, *bounds))
+            .copied()
+            .collect::<Vec<_>>();
+        selection.merged_ranges = intersecting
+            .iter()
+            .map(|(reference, _)| (*reference).clone())
+            .collect();
+        let mut existing = selection
+            .cells
+            .iter()
+            .map(|cell| (cell.row, cell.column))
+            .collect::<HashSet<_>>();
+        for (reference, merge_bounds) in intersecting {
+            let anchor = format!(
+                "{}{}",
+                column_name(merge_bounds.start_column),
+                merge_bounds.start_row
+            );
+            for cell in &mut selection.cells {
+                if contains(merge_bounds, cell.row, cell.column) && cell.merge.is_none() {
+                    cell.merge = Some(merge_membership(
+                        reference,
+                        &anchor,
+                        merge_bounds,
+                        cell.row,
+                        cell.column,
+                    ));
+                }
+            }
+            let intersection = intersect_bounds(plan.bounds, merge_bounds);
+            'rows: for row in intersection.start_row..=intersection.end_row {
+                for column in intersection.start_column..=intersection.end_column {
+                    if existing.contains(&(row, column)) {
+                        continue;
+                    }
+                    if *remaining_cells == 0 {
+                        selection.truncated = true;
+                        break 'rows;
+                    }
+                    selection.cells.push(blank_merge_cell(
+                        row,
+                        column,
+                        merge_membership(reference, &anchor, merge_bounds, row, column),
+                    ));
+                    existing.insert((row, column));
+                    *remaining_cells -= 1;
+                }
+            }
+        }
+        selection.cells.sort_by_key(|cell| (cell.row, cell.column));
+    }
+}
+
+fn merge_membership(
+    range: &str,
+    anchor: &str,
+    bounds: SelectionBounds,
+    row: u32,
+    column: u16,
+) -> WorkbookMergeMembership {
+    WorkbookMergeMembership {
+        range: range.to_owned(),
+        anchor: anchor.to_owned(),
+        role: if row == bounds.start_row && column == bounds.start_column {
+            WorkbookMergeRole::Anchor
+        } else {
+            WorkbookMergeRole::Covered
+        },
+    }
+}
+
+fn blank_merge_cell(row: u32, column: u16, merge: WorkbookMergeMembership) -> WorkbookCell {
+    WorkbookCell {
+        reference: format!("{}{row}", column_name(column)),
+        row,
+        column,
+        value_type: CellValueType::Blank,
+        value: String::new(),
+        display: String::new(),
+        formula: None,
+        formula_kind: None,
+        formula_reference: None,
+        shared_formula_index: None,
+        rich_text: false,
+        font_strike: None,
+        font_color: None,
+        rich_text_runs: Vec::new(),
+        merge: Some(merge),
+        style_index: None,
+        number_format: None,
+    }
+}
+
+fn parse_range_reference(reference: &str) -> Option<SelectionBounds> {
+    let (start, end) = reference
+        .split_once(':')
+        .map_or((reference, reference), |parts| parts);
+    let (start_row, start_column) = parse_cell_reference(start)?;
+    let (end_row, end_column) = parse_cell_reference(end)?;
+    (start_row <= end_row && start_column <= end_column).then_some(SelectionBounds {
+        start_row,
+        start_column,
+        end_row,
+        end_column,
+    })
+}
+
+fn bounds_intersect(left: SelectionBounds, right: SelectionBounds) -> bool {
+    left.start_row <= right.end_row
+        && right.start_row <= left.end_row
+        && left.start_column <= right.end_column
+        && right.start_column <= left.end_column
+}
+
+fn intersect_bounds(left: SelectionBounds, right: SelectionBounds) -> SelectionBounds {
+    SelectionBounds {
+        start_row: left.start_row.max(right.start_row),
+        start_column: left.start_column.max(right.start_column),
+        end_row: left.end_row.min(right.end_row),
+        end_column: left.end_column.min(right.end_column),
+    }
 }
 
 fn capture_formula_metadata(
@@ -2015,12 +3385,19 @@ fn finish_cell(
         ReadError::InvalidXlsx("worksheet cell has an invalid or missing reference".to_owned())
     })?;
     let number_format = styles.number_format(cell.style_index);
+    let font = styles.font(cell.style_index);
     let raw = if cell.has_inline {
         cell.inline
     } else {
         cell.value
     };
     let mut rich_text = cell.rich_text;
+    let mut rich_text_runs = cell.rich_text_runs;
+    for run in &mut rich_text_runs {
+        if let Some(color) = &mut run.font_color {
+            color.resolved_rgb = resolve_color(color, &styles.theme);
+        }
+    }
     let (value_type, display) = match cell.cell_type.as_deref() {
         Some("s") => {
             let index = raw.parse::<usize>().map_err(|_| {
@@ -2029,6 +3406,7 @@ fn finish_cell(
             match shared_strings.get(index) {
                 Some(value) => {
                     rich_text = value.rich;
+                    rich_text_runs = value.runs.clone();
                     (CellValueType::String, value.text.clone())
                 }
                 None => {
@@ -2083,6 +3461,10 @@ fn finish_cell(
             .then_some(cell.shared_formula_index)
             .flatten(),
         rich_text,
+        font_strike: font.and_then(|font| font.strike),
+        font_color: font.and_then(|font| font.color.clone()),
+        rich_text_runs,
+        merge: None,
         style_index: cell.style_index,
         number_format,
     }))
@@ -2162,6 +3544,11 @@ fn push_selection(
         sheet,
         range: format_bounds(bounds),
         bounds,
+        used_bounds: None,
+        merged_ranges: Vec::new(),
+        images: Vec::new(),
+        images_truncated: false,
+        overflow: WorkbookSelectionOverflow::default(),
         cells: Vec::new(),
         truncated: false,
     });
@@ -2336,16 +3723,19 @@ fn render_markdown_generated_update(
 
 fn render_markdown_manifest(output: &mut String, workbook: &WorkbookInfo) {
     output.push_str("<!-- opsail:xlsx-generated:manifest:start -->\n");
-    output.push_str("| # | Sheet | State | Declared dimension | Semantic bounds | Selected |\n");
-    output.push_str("|---:|---|---|---|---|---|\n");
+    output.push_str(
+        "| # | Sheet | State | Declared dimension | Semantic bounds | Pictures | Selected |\n",
+    );
+    output.push_str("|---:|---|---|---|---|---:|---|\n");
     for sheet in &workbook.sheets {
         output.push_str(&format!(
-            "| {} | {} | {:?} | {} | {} | {} |\n",
+            "| {} | {} | {:?} | {} | {} | {} | {} |\n",
             sheet.index + 1,
             markdown_escape(&sheet.name),
             sheet.state,
             sheet.declared_dimension.as_deref().unwrap_or(""),
             sheet.semantic_bounds.as_deref().unwrap_or(""),
+            sheet.pictures.len(),
             if sheet.selected { "yes" } else { "no" }
         ));
     }
@@ -2364,6 +3754,31 @@ fn render_markdown_manifest(output: &mut String, workbook: &WorkbookInfo) {
             ));
         }
     }
+    if workbook
+        .sheets
+        .iter()
+        .any(|sheet| has_print_evidence(&sheet.print))
+    {
+        output.push_str("\n## Print evidence\n\n");
+        output.push_str(
+            "| Sheet | Print area | Print titles | Page setup | Row breaks | Column breaks |\n|---|---|---|---|---|---|\n",
+        );
+        for sheet in workbook
+            .sheets
+            .iter()
+            .filter(|sheet| has_print_evidence(&sheet.print))
+        {
+            output.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} |\n",
+                markdown_escape(&sheet.name),
+                markdown_escape(sheet.print.print_area.as_deref().unwrap_or("")),
+                markdown_escape(sheet.print.print_titles.as_deref().unwrap_or("")),
+                markdown_escape(&page_setup_summary(sheet.print.page_setup.as_ref())),
+                join_u32(&sheet.print.row_breaks),
+                join_u32(&sheet.print.column_breaks),
+            ));
+        }
+    }
     output.push_str("<!-- opsail:xlsx-generated:manifest:end -->\n");
 }
 
@@ -2377,6 +3792,36 @@ fn render_markdown_selection(output: &mut String, selection: &WorkbookSelection)
         markdown_escape(&selection.sheet),
         selection.range
     ));
+    if let Some(used_bounds) = &selection.used_bounds {
+        output.push_str(&format!(
+            "> Used cells on the requested rows span `{used_bounds}`.\n"
+        ));
+    }
+    render_markdown_selection_overflow(output, &selection.overflow);
+    if !selection.merged_ranges.is_empty() {
+        output.push_str(&format!(
+            "> Intersecting merges: {}. Covered cells remain blank and point to their anchor in JSON.\n",
+            selection
+                .merged_ranges
+                .iter()
+                .map(|range| format!("`{range}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !selection.images.is_empty() {
+        output.push_str(&format!(
+            "> Intersecting worksheet pictures: {}. Pixels are not OCR text; open the bounded `dataUri` in JSON when present.\n",
+            selection.images.len()
+        ));
+    }
+    if selection.used_bounds.is_some()
+        || !selection.overflow.is_empty()
+        || !selection.merged_ranges.is_empty()
+        || !selection.images.is_empty()
+    {
+        output.push('\n');
+    }
     let rows = u64::from(selection.bounds.end_row - selection.bounds.start_row + 1);
     let columns = u64::from(selection.bounds.end_column - selection.bounds.start_column + 1);
     if rows.saturating_mul(columns) <= PREVIEW_GRID_MAX_AREA && columns <= 50 {
@@ -2393,10 +3838,122 @@ fn render_markdown_selection(output: &mut String, selection: &WorkbookSelection)
             ));
         }
     }
+    render_markdown_text_formatting(output, selection);
+    render_markdown_pictures(output, selection);
     if selection.truncated {
         output.push_str("\n> Selection output was truncated by the cell limit.\n");
     }
+    if selection.images_truncated {
+        output.push_str("\n> Some picture payloads or picture references were omitted by image limits; metadata for retained entries remains available.\n");
+    }
     output.push_str(&format!("<!-- opsail:xlsx-generated:{marker}:end -->\n"));
+}
+
+fn render_markdown_pictures(output: &mut String, selection: &WorkbookSelection) {
+    if selection.images.is_empty() {
+        return;
+    }
+    output.push_str("\n### Worksheet pictures\n\n");
+    output.push_str("| Anchor | Media part | Content type | Bytes | SHA-256 | Payload |\n");
+    output.push_str("|---|---|---|---:|---|---|\n");
+    for picture in &selection.images {
+        let anchor = picture.to_cell.as_ref().map_or_else(
+            || picture.from_cell.clone(),
+            |to| format!("{}:{}", picture.from_cell, to),
+        );
+        let payload = if picture.data_uri.is_some() {
+            "dataUri in JSON"
+        } else if picture.payload_truncated {
+            "metadata only (limit)"
+        } else {
+            "metadata only"
+        };
+        output.push_str(&format!(
+            "| {} | {} | {} | {} | `{}` | {} |\n",
+            markdown_escape(&anchor),
+            markdown_escape(&picture.media_part),
+            markdown_escape(&picture.content_type),
+            picture.byte_size,
+            picture.sha256,
+            payload,
+        ));
+    }
+    output.push_str("\n> Picture bytes are evidence only; Opsail does not OCR them or treat them as worksheet cell text.\n");
+}
+
+fn render_markdown_selection_overflow(output: &mut String, overflow: &WorkbookSelectionOverflow) {
+    if let Some(left) = &overflow.left {
+        output.push_str(&format!(
+            "> Column overflow left: {} through {} ({} used cells).\n",
+            column_name(left.min_column),
+            column_name(left.max_column),
+            left.cell_count
+        ));
+    }
+    if let Some(right) = &overflow.right {
+        output.push_str(&format!(
+            "> Column overflow right: {} through {} ({} used cells).\n",
+            column_name(right.min_column),
+            column_name(right.max_column),
+            right.cell_count
+        ));
+    }
+    if let Some(above) = &overflow.above {
+        output.push_str(&format!(
+            "> Scanned row overflow above: {} through {} ({} used cells in the requested columns).\n",
+            above.min_row, above.max_row, above.cell_count
+        ));
+    }
+    if let Some(below) = &overflow.below {
+        output.push_str(&format!(
+            "> Scanned row overflow below: {} through {} ({} used cells in the requested columns).\n",
+            below.min_row, below.max_row, below.cell_count
+        ));
+    }
+}
+
+fn has_print_evidence(print: &WorksheetPrintEvidence) -> bool {
+    print.print_area.is_some()
+        || print.print_titles.is_some()
+        || print.page_setup.is_some()
+        || print.print_options.is_some()
+        || !print.row_breaks.is_empty()
+        || !print.column_breaks.is_empty()
+        || print.header_footer
+}
+
+fn page_setup_summary(page_setup: Option<&WorksheetPageSetup>) -> String {
+    let Some(page_setup) = page_setup else {
+        return String::new();
+    };
+    let mut fields = Vec::new();
+    if let Some(value) = &page_setup.orientation {
+        fields.push(format!("orientation={value}"));
+    }
+    if let Some(value) = page_setup.paper_size {
+        fields.push(format!("paperSize={value}"));
+    }
+    if let Some(value) = page_setup.fit_to_page {
+        fields.push(format!("fitToPage={value}"));
+    }
+    if let Some(value) = page_setup.fit_to_width {
+        fields.push(format!("fitToWidth={value}"));
+    }
+    if let Some(value) = page_setup.fit_to_height {
+        fields.push(format!("fitToHeight={value}"));
+    }
+    if let Some(value) = page_setup.scale {
+        fields.push(format!("scale={value}"));
+    }
+    fields.join(", ")
+}
+
+fn join_u32(values: &[u32]) -> String {
+    values
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Merge generated workbook blocks into an agent-maintained Markdown mirror.
@@ -2561,9 +4118,10 @@ fn render_html_manifest(output: &mut String, workbook: &WorkbookInfo) {
     output.push_str("<!-- opsail:xlsx-generated:manifest:start -->\n<ul>");
     for sheet in &workbook.sheets {
         output.push_str(&format!(
-            "<li>{} ({:?})</li>",
+            "<li>{} ({:?}; {} worksheet pictures)</li>",
             html_escape(&sheet.name),
-            sheet.state
+            sheet.state,
+            sheet.pictures.len()
         ));
     }
     output.push_str("</ul>\n<!-- opsail:xlsx-generated:manifest:end -->\n");
@@ -2572,10 +4130,37 @@ fn render_html_manifest(output: &mut String, workbook: &WorkbookInfo) {
 fn render_html_selection(output: &mut String, selection: &WorkbookSelection) {
     let marker = selection_marker(&selection.requested);
     output.push_str(&format!(
-        "<!-- opsail:xlsx-generated:{marker}:start -->\n<section><h2>{}!{}</h2><table><thead><tr><th>Cell</th><th>Value</th><th>Type</th><th>Formula</th></tr></thead><tbody>",
+        "<!-- opsail:xlsx-generated:{marker}:start -->\n<section><h2>{}!{}</h2>",
         html_escape(&selection.sheet),
         html_escape(&selection.range)
     ));
+    if let Some(used_bounds) = &selection.used_bounds {
+        output.push_str(&format!(
+            "<p>Used cells on the requested rows span <code>{}</code>.</p>",
+            html_escape(used_bounds)
+        ));
+    }
+    if let Some(right) = &selection.overflow.right {
+        output.push_str(&format!(
+            "<p>Column overflow right: {} through {} ({} used cells).</p>",
+            column_name(right.min_column),
+            column_name(right.max_column),
+            right.cell_count
+        ));
+    }
+    if !selection.merged_ranges.is_empty() {
+        output.push_str(&format!(
+            "<p>Intersecting merges: {}.</p>",
+            html_escape(&selection.merged_ranges.join(", "))
+        ));
+    }
+    if !selection.images.is_empty() {
+        output.push_str(&format!(
+            "<p>{} intersecting worksheet pictures. Pixel payloads are bounded data URIs in JSON and are not OCR text.</p>",
+            selection.images.len()
+        ));
+    }
+    output.push_str("<table><thead><tr><th>Cell</th><th>Value</th><th>Type</th><th>Formula</th></tr></thead><tbody>");
     for cell in &selection.cells {
         output.push_str(&format!(
             "<tr><td>{}</td><td>{}</td><td>{:?}</td><td>{}</td></tr>",
@@ -2585,9 +4170,113 @@ fn render_html_selection(output: &mut String, selection: &WorkbookSelection) {
             html_escape(cell.formula.as_deref().unwrap_or(""))
         ));
     }
+    output.push_str("</tbody></table>");
+    let formatted: Vec<_> = selection
+        .cells
+        .iter()
+        .filter_map(formatting_summary)
+        .collect();
+    if !formatted.is_empty() {
+        output.push_str("<h3>Text formatting</h3><ul>");
+        for summary in formatted {
+            output.push_str(&format!("<li>{}</li>", html_escape(&summary)));
+        }
+        output.push_str("</ul>");
+    }
+    if !selection.images.is_empty() {
+        output.push_str("<h3>Worksheet pictures</h3><ul>");
+        for picture in &selection.images {
+            let anchor = picture.to_cell.as_ref().map_or_else(
+                || picture.from_cell.clone(),
+                |to| format!("{}:{}", picture.from_cell, to),
+            );
+            let payload = if picture.data_uri.is_some() {
+                "dataUri in JSON"
+            } else if picture.payload_truncated {
+                "metadata only (limit)"
+            } else {
+                "metadata only"
+            };
+            output.push_str(&format!(
+                "<li>{}: {} ({} bytes, {}, {})</li>",
+                html_escape(&anchor),
+                html_escape(&picture.media_part),
+                picture.byte_size,
+                html_escape(&picture.content_type),
+                payload,
+            ));
+        }
+        output.push_str("</ul>");
+    }
     output.push_str(&format!(
-        "</tbody></table></section>\n<!-- opsail:xlsx-generated:{marker}:end -->\n"
+        "</section>\n<!-- opsail:xlsx-generated:{marker}:end -->\n"
     ));
+}
+
+fn render_markdown_text_formatting(output: &mut String, selection: &WorkbookSelection) {
+    let formatted: Vec<_> = selection
+        .cells
+        .iter()
+        .filter_map(formatting_summary)
+        .collect();
+    if formatted.is_empty() {
+        return;
+    }
+    output.push_str("\n### Text formatting\n\n");
+    for summary in formatted {
+        output.push_str(&format!("- {}\n", markdown_escape(&summary)));
+    }
+}
+
+fn formatting_summary(cell: &WorkbookCell) -> Option<String> {
+    let mut details = Vec::new();
+    if cell.font_strike == Some(true) {
+        details.push("cell strike=true".to_owned());
+    }
+    if let Some(color) = &cell.font_color {
+        details.push(format!("cell color={}", color_summary(color)));
+    }
+    for (index, run) in cell.rich_text_runs.iter().enumerate() {
+        if run.strike == Some(true) || run.font_color.is_some() {
+            let mut run_details = Vec::new();
+            if run.strike == Some(true) {
+                run_details.push("strike=true".to_owned());
+            }
+            if let Some(color) = &run.font_color {
+                run_details.push(format!("color={}", color_summary(color)));
+            }
+            details.push(format!(
+                "run {} {:?}: {}",
+                index + 1,
+                run.text,
+                run_details.join(", ")
+            ));
+        }
+    }
+    (!details.is_empty()).then(|| format!("{}: {}", cell.reference, details.join("; ")))
+}
+
+fn color_summary(color: &WorkbookFontColor) -> String {
+    let mut fields = Vec::new();
+    if let Some(value) = &color.rgb {
+        fields.push(format!("rgb={value}"));
+    }
+    if let Some(value) = color.theme {
+        fields.push(format!("theme={value}"));
+    }
+    if let Some(value) = color.indexed {
+        fields.push(format!("indexed={value}"));
+    }
+    if let Some(value) = color.auto {
+        fields.push(format!("auto={value}"));
+    }
+    if let Some(value) = color.tint {
+        fields.push(format!("tint={value}"));
+    }
+    if let Some(value) = &color.resolved_rgb {
+        fields.push(format!("resolvedRgb={value}"));
+    }
+    fields.join(",")
 }
 
 fn markdown_escape(value: &str) -> String {
@@ -2822,15 +4511,55 @@ fn normalize_workbook_target(target: &str) -> Result<String, ReadError> {
 }
 
 fn worksheet_relationship_path(path: &str) -> Result<String, ReadError> {
+    part_relationship_path(path)
+}
+
+fn part_relationship_path(path: &str) -> Result<String, ReadError> {
     let (directory, file) = path
         .rsplit_once('/')
-        .ok_or_else(|| ReadError::InvalidXlsx("worksheet part path has no directory".to_owned()))?;
+        .ok_or_else(|| ReadError::InvalidXlsx("OOXML part path has no directory".to_owned()))?;
     if file.is_empty() || directory.is_empty() {
         return Err(ReadError::InvalidXlsx(
-            "worksheet part path is invalid".to_owned(),
+            "OOXML part path is invalid".to_owned(),
         ));
     }
     Ok(format!("{directory}/_rels/{file}.rels"))
+}
+
+fn resolve_part_target(source_part: &str, target: &str) -> Result<String, ReadError> {
+    let mut components = if target.starts_with('/') {
+        Vec::new()
+    } else {
+        source_part
+            .rsplit_once('/')
+            .map(|(directory, _)| {
+                directory
+                    .split('/')
+                    .filter(|component| !component.is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    for component in target.trim_start_matches('/').split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                if components.pop().is_none() {
+                    return Err(ReadError::InvalidXlsx(
+                        "OOXML relationship target escapes the package root".to_owned(),
+                    ));
+                }
+            }
+            component => components.push(component.to_owned()),
+        }
+    }
+    if components.is_empty() {
+        return Err(ReadError::InvalidXlsx(
+            "OOXML relationship target is empty".to_owned(),
+        ));
+    }
+    Ok(components.join("/"))
 }
 
 fn is_worksheet_part(name: &str) -> bool {
@@ -2946,5 +4675,37 @@ mod tests {
         assert!(!is_date_format("[Blue][<=100]0.00"));
         assert!(is_date_format("[h]:mm:ss"));
         assert!(is_date_format("[$-409]yyyy-mm-dd"));
+    }
+
+    #[test]
+    fn parses_one_cell_picture_anchors_and_skips_charts() {
+        let xml = r#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
+          xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+          <xdr:oneCellAnchor><xdr:from><xdr:col>5</xdr:col><xdr:row>11</xdr:row></xdr:from>
+            <xdr:ext cx="1" cy="1"/><xdr:pic><xdr:blipFill><a:blip r:embed="rIdImage"/></xdr:blipFill></xdr:pic><xdr:clientData/>
+          </xdr:oneCellAnchor>
+          <xdr:twoCellAnchor><xdr:from><xdr:col>0</xdr:col><xdr:row>0</xdr:row></xdr:from>
+            <xdr:to><xdr:col>3</xdr:col><xdr:row>9</xdr:row></xdr:to><xdr:graphicFrame/><xdr:clientData/>
+          </xdr:twoCellAnchor>
+        </xdr:wsDr>"#;
+        let relationships = HashMap::from([(
+            "rIdImage".to_owned(),
+            PartRelationship {
+                relationship_type:
+                    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
+                        .to_owned(),
+                target: "../media/image1.png".to_owned(),
+                external: false,
+            },
+        )]);
+
+        let pictures =
+            parse_drawing_pictures(xml, "xl/drawings/drawing1.xml", &relationships).unwrap();
+        assert_eq!(pictures.len(), 1);
+        assert_eq!(pictures[0].from.row, Some(11));
+        assert_eq!(pictures[0].from.column, Some(5));
+        assert!(pictures[0].to.is_none());
+        assert_eq!(pictures[0].media_part, "xl/media/image1.png");
     }
 }

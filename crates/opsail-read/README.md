@@ -31,6 +31,9 @@ browser path.
 - Inventory hyperlinks, filters, tables, conditional formats, validations,
   page setup, outlines, drawings, charts, images, comments, controls,
   sparklines, themes, and VBA-project presence without executing active content.
+- Resolve worksheet picture anchors and media relationships, inventory their
+  content type/size/SHA-256, and publish bounded data-URI pixels only for
+  pictures intersecting selected ranges.
 - Compare ZIP-part revisions without expanding OOXML, refresh changed worksheet
   selections through `WorkbookSession`, and merge generated Markdown blocks
   without overwriting agent-authored text.
@@ -101,8 +104,8 @@ such as `A1:XFD1048576` never causes rectangular allocation.
 
 With no explicit ranges, visible sheets receive a bounded preview controlled by
 `preview_rows` and `preview_columns`; hidden sheets remain in the manifest.
-`max_cells` bounds published non-empty cells and marks affected selections as
-truncated. `max_expanded_bytes` limits cumulative uncompressed OOXML read from
+`max_cells` bounds published cell records, including blank merge-covered cells,
+and marks affected selections as truncated. `max_expanded_bytes` limits cumulative uncompressed OOXML read from
 the ZIP package. The normal `max_bytes` limit still applies to the compressed
 file itself. Stdout adapters can call `WorkbookReadResult::truncate_published_cells`
 and rerender a stable prefix when their serialized transport has a stricter byte
@@ -110,11 +113,12 @@ budget than the cell-count limit.
 
 Formula expressions and cached values are reported separately. Opsail does not
 recalculate formulas, so callers must not describe the cached value as current.
-Legacy `.xls`, encrypted workbooks, macros, charts, images, conditional-format
-rendering, and Excel-accurate visual layout are outside this reader.
+Legacy `.xls`, encrypted workbooks, macros, chart reconstruction, image OCR,
+textbox/VML extraction, conditional-format rendering, and Excel-accurate visual
+layout are outside this reader.
 
-The read-side feature levels, completeness labels, human/agent mirror contract,
-and 80% efficiency gate are specified in
+The read-side feature levels, tail/cell-data completeness labels, range-overflow
+evidence, and human/agent mirror contract are specified in
 [`XLSX_COMPATIBILITY.md`](XLSX_COMPATIBILITY.md).
 
 ## Refresh a human-owned workbook without losing agent Markdown

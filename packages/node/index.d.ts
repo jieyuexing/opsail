@@ -150,9 +150,36 @@ export interface WorkbookSheet {
   semanticBoundsComplete: boolean;
   selected: boolean;
   mergedRanges: string[];
+  /** Worksheet picture inventory. Payloads are published only on intersecting selections. */
+  pictures: WorkbookPicture[];
   hiddenRows: number;
   hiddenColumns: number;
+  print: WorksheetPrintEvidence;
   features: WorksheetFeatureInventory;
+}
+
+export interface WorksheetPrintEvidence {
+  printArea?: string;
+  printTitles?: string;
+  pageSetup?: WorksheetPageSetup;
+  printOptions?: WorksheetPrintOptions;
+  rowBreaks: number[];
+  columnBreaks: number[];
+  headerFooter: boolean;
+}
+
+export interface WorksheetPageSetup {
+  orientation?: string;
+  paperSize?: number;
+  fitToPage?: boolean;
+  fitToWidth?: number;
+  fitToHeight?: number;
+  scale?: number;
+}
+
+export interface WorksheetPrintOptions {
+  gridLines?: boolean;
+  headings?: boolean;
 }
 
 export interface WorkbookRevision {
@@ -194,6 +221,8 @@ export interface WorkbookHyperlink {
 
 export interface WorksheetFeatureInventory {
   scanned: boolean;
+  cellDataComplete: boolean;
+  tailFeaturesComplete: boolean;
   complete: boolean;
   featureReferencesTruncated: boolean;
   formulaCells: number;
@@ -233,8 +262,53 @@ export interface WorkbookSelection {
     endRow: number;
     endColumn: number;
   };
+  usedBounds?: string;
+  mergedRanges: string[];
+  /** Pictures whose DrawingML anchors intersect the requested rectangle. */
+  images: WorkbookPicture[];
+  /** Independent of cell `truncated`; true when image payload/reference caps were hit. */
+  imagesTruncated: boolean;
+  overflow?: WorkbookSelectionOverflow;
   cells: WorkbookCell[];
   truncated: boolean;
+}
+
+export interface WorkbookPicture {
+  sheet: string;
+  fromCell: string;
+  toCell?: string;
+  /** Zero-based OOXML drawing marker index. */
+  fromRowIndex: number;
+  /** Zero-based OOXML drawing marker index. */
+  fromColumnIndex: number;
+  toRowIndex?: number;
+  toColumnIndex?: number;
+  mediaPart: string;
+  contentType: string;
+  byteSize: number;
+  sha256: string;
+  /** Bounded image payload; absent from sheet inventory and when limits are hit. */
+  dataUri?: string;
+  payloadTruncated: boolean;
+}
+
+export interface WorkbookSelectionOverflow {
+  left?: WorkbookColumnOverflow;
+  right?: WorkbookColumnOverflow;
+  above?: WorkbookRowOverflow;
+  below?: WorkbookRowOverflow;
+}
+
+export interface WorkbookColumnOverflow {
+  minColumn: number;
+  maxColumn: number;
+  cellCount: number;
+}
+
+export interface WorkbookRowOverflow {
+  minRow: number;
+  maxRow: number;
+  cellCount: number;
 }
 
 export interface WorkbookCell {
@@ -249,8 +323,33 @@ export interface WorkbookCell {
   formulaReference?: string;
   sharedFormulaIndex?: number;
   richText: boolean;
+  fontStrike?: boolean;
+  fontColor?: WorkbookFontColor;
+  richTextRuns?: WorkbookRichTextRun[];
+  merge?: WorkbookMergeMembership;
   styleIndex?: number;
   numberFormat?: string;
+}
+
+export interface WorkbookMergeMembership {
+  range: string;
+  anchor: string;
+  role: "anchor" | "covered";
+}
+
+export interface WorkbookFontColor {
+  rgb?: string;
+  theme?: number;
+  indexed?: number;
+  auto?: boolean;
+  tint?: number;
+  resolvedRgb?: string;
+}
+
+export interface WorkbookRichTextRun {
+  text: string;
+  strike?: boolean;
+  fontColor?: WorkbookFontColor;
 }
 
 export interface WorkbookStatistics {

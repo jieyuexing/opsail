@@ -619,9 +619,44 @@ function isWorkbookSheet(value) {
     typeof value.selected === "boolean" &&
     Array.isArray(value.mergedRanges) &&
     value.mergedRanges.every((range) => typeof range === "string") &&
+    Array.isArray(value.pictures) &&
+    value.pictures.every(isWorkbookPicture) &&
     isNonNegativeSafeInteger(value.hiddenRows) &&
     isNonNegativeSafeInteger(value.hiddenColumns) &&
+    isWorksheetPrintEvidence(value.print) &&
     isWorksheetFeatureInventory(value.features)
+  );
+}
+
+function isWorksheetPrintEvidence(value) {
+  return (
+    isRecord(value) &&
+    isOptionalString(value.printArea) &&
+    isOptionalString(value.printTitles) &&
+    (value.pageSetup === undefined || isWorksheetPageSetup(value.pageSetup)) &&
+    (value.printOptions === undefined ||
+      (isRecord(value.printOptions) &&
+        (value.printOptions.gridLines === undefined ||
+          typeof value.printOptions.gridLines === "boolean") &&
+        (value.printOptions.headings === undefined ||
+          typeof value.printOptions.headings === "boolean"))) &&
+    Array.isArray(value.rowBreaks) &&
+    value.rowBreaks.every(isNonNegativeSafeInteger) &&
+    Array.isArray(value.columnBreaks) &&
+    value.columnBreaks.every(isNonNegativeSafeInteger) &&
+    typeof value.headerFooter === "boolean"
+  );
+}
+
+function isWorksheetPageSetup(value) {
+  return (
+    isRecord(value) &&
+    isOptionalString(value.orientation) &&
+    ["paperSize", "fitToWidth", "fitToHeight", "scale"].every(
+      (field) =>
+        value[field] === undefined || isNonNegativeSafeInteger(value[field]),
+    ) &&
+    (value.fitToPage === undefined || typeof value.fitToPage === "boolean")
   );
 }
 
@@ -643,9 +678,75 @@ function isWorkbookSelection(value) {
     typeof value.sheet === "string" &&
     typeof value.range === "string" &&
     isSelectionBounds(value.bounds) &&
+    isOptionalString(value.usedBounds) &&
+    Array.isArray(value.mergedRanges) &&
+    value.mergedRanges.every((range) => typeof range === "string") &&
+    Array.isArray(value.images) &&
+    value.images.every(isWorkbookPicture) &&
+    typeof value.imagesTruncated === "boolean" &&
+    (value.overflow === undefined || isWorkbookSelectionOverflow(value.overflow)) &&
     Array.isArray(value.cells) &&
     value.cells.every(isWorkbookCell) &&
     typeof value.truncated === "boolean"
+  );
+}
+
+function isWorkbookPicture(value) {
+  return (
+    isRecord(value) &&
+    typeof value.sheet === "string" &&
+    typeof value.fromCell === "string" &&
+    isOptionalString(value.toCell) &&
+    isNonNegativeSafeInteger(value.fromRowIndex) &&
+    isNonNegativeSafeInteger(value.fromColumnIndex) &&
+    (value.toRowIndex === undefined ||
+      isNonNegativeSafeInteger(value.toRowIndex)) &&
+    (value.toColumnIndex === undefined ||
+      isNonNegativeSafeInteger(value.toColumnIndex)) &&
+    typeof value.mediaPart === "string" &&
+    typeof value.contentType === "string" &&
+    isNonNegativeSafeInteger(value.byteSize) &&
+    typeof value.sha256 === "string" &&
+    /^[0-9a-f]{64}$/.test(value.sha256) &&
+    (value.dataUri === undefined ||
+      (typeof value.dataUri === "string" &&
+        value.dataUri.startsWith(`data:${value.contentType};base64,`))) &&
+    typeof value.payloadTruncated === "boolean"
+  );
+}
+
+function isWorkbookSelectionOverflow(value) {
+  return (
+    isRecord(value) &&
+    ["left", "right"].every(
+      (field) =>
+        value[field] === undefined || isWorkbookColumnOverflow(value[field]),
+    ) &&
+    ["above", "below"].every(
+      (field) => value[field] === undefined || isWorkbookRowOverflow(value[field]),
+    )
+  );
+}
+
+function isWorkbookColumnOverflow(value) {
+  return (
+    isRecord(value) &&
+    Number.isSafeInteger(value.minColumn) &&
+    value.minColumn > 0 &&
+    Number.isSafeInteger(value.maxColumn) &&
+    value.maxColumn >= value.minColumn &&
+    isNonNegativeSafeInteger(value.cellCount)
+  );
+}
+
+function isWorkbookRowOverflow(value) {
+  return (
+    isRecord(value) &&
+    Number.isSafeInteger(value.minRow) &&
+    value.minRow > 0 &&
+    Number.isSafeInteger(value.maxRow) &&
+    value.maxRow >= value.minRow &&
+    isNonNegativeSafeInteger(value.cellCount)
   );
 }
 
@@ -685,9 +786,46 @@ function isWorkbookCell(value) {
     (value.sharedFormulaIndex === undefined ||
       isNonNegativeSafeInteger(value.sharedFormulaIndex)) &&
     typeof value.richText === "boolean" &&
+    (value.fontStrike === undefined || typeof value.fontStrike === "boolean") &&
+    (value.fontColor === undefined || isWorkbookFontColor(value.fontColor)) &&
+    (value.richTextRuns === undefined ||
+      (Array.isArray(value.richTextRuns) &&
+        value.richTextRuns.every(isWorkbookRichTextRun))) &&
+    (value.merge === undefined || isWorkbookMergeMembership(value.merge)) &&
     (value.styleIndex === undefined ||
       isNonNegativeSafeInteger(value.styleIndex)) &&
     isOptionalString(value.numberFormat)
+  );
+}
+
+function isWorkbookMergeMembership(value) {
+  return (
+    isRecord(value) &&
+    typeof value.range === "string" &&
+    typeof value.anchor === "string" &&
+    (value.role === "anchor" || value.role === "covered")
+  );
+}
+
+function isWorkbookFontColor(value) {
+  return (
+    isRecord(value) &&
+    isOptionalString(value.rgb) &&
+    (value.theme === undefined || isNonNegativeSafeInteger(value.theme)) &&
+    (value.indexed === undefined || isNonNegativeSafeInteger(value.indexed)) &&
+    (value.auto === undefined || typeof value.auto === "boolean") &&
+    (value.tint === undefined ||
+      (typeof value.tint === "number" && Number.isFinite(value.tint))) &&
+    isOptionalString(value.resolvedRgb)
+  );
+}
+
+function isWorkbookRichTextRun(value) {
+  return (
+    isRecord(value) &&
+    typeof value.text === "string" &&
+    (value.strike === undefined || typeof value.strike === "boolean") &&
+    (value.fontColor === undefined || isWorkbookFontColor(value.fontColor))
   );
 }
 
@@ -736,6 +874,8 @@ function isWorksheetFeatureInventory(value) {
   return (
     isRecord(value) &&
     typeof value.scanned === "boolean" &&
+    typeof value.cellDataComplete === "boolean" &&
+    typeof value.tailFeaturesComplete === "boolean" &&
     typeof value.complete === "boolean" &&
     typeof value.featureReferencesTruncated === "boolean" &&
     [

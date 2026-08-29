@@ -89,10 +89,43 @@ function validWorkbookResult() {
           semanticBoundsComplete: false,
           selected: true,
           mergedRanges: [],
+          pictures: [
+            {
+              sheet: "Data",
+              fromCell: "A1",
+              toCell: "D10",
+              fromRowIndex: 0,
+              fromColumnIndex: 0,
+              toRowIndex: 9,
+              toColumnIndex: 3,
+              mediaPart: "xl/media/image1.png",
+              contentType: "image/png",
+              byteSize: 68,
+              sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+              payloadTruncated: false,
+            },
+          ],
           hiddenRows: 0,
           hiddenColumns: 0,
+          print: {
+            printArea: "'Data'!$A$1:$Q$20",
+            printTitles: "'Data'!$1:$2",
+            pageSetup: {
+              orientation: "landscape",
+              paperSize: 9,
+              fitToPage: true,
+              fitToWidth: 1,
+              fitToHeight: 0,
+            },
+            printOptions: { gridLines: false, headings: true },
+            rowBreaks: [20],
+            columnBreaks: [17],
+            headerFooter: true,
+          },
           features: {
             scanned: true,
+            cellDataComplete: false,
+            tailFeaturesComplete: true,
             complete: false,
             featureReferencesTruncated: false,
             formulaCells: 0,
@@ -127,6 +160,29 @@ function validWorkbookResult() {
             endRow: 2,
             endColumn: 2,
           },
+          usedBounds: "A1:Q2",
+          mergedRanges: ["A1:C1"],
+          images: [
+            {
+              sheet: "Data",
+              fromCell: "A1",
+              toCell: "D10",
+              fromRowIndex: 0,
+              fromColumnIndex: 0,
+              toRowIndex: 9,
+              toColumnIndex: 3,
+              mediaPart: "xl/media/image1.png",
+              contentType: "image/png",
+              byteSize: 68,
+              sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+              dataUri: "data:image/png;base64,iVBORw0KGgo=",
+              payloadTruncated: false,
+            },
+          ],
+          imagesTruncated: false,
+          overflow: {
+            right: { minColumn: 17, maxColumn: 17, cellCount: 1 },
+          },
           cells: [
             {
               reference: "A1",
@@ -135,7 +191,13 @@ function validWorkbookResult() {
               valueType: "string",
               value: "value",
               display: "value",
-              richText: false,
+              richText: true,
+              fontStrike: true,
+              fontColor: { theme: 4, tint: 0.5, resolvedRgb: "8CB3D9" },
+              richTextRuns: [
+                { text: "value", strike: true, fontColor: { rgb: "FF123456", resolvedRgb: "123456" } },
+              ],
+              merge: { range: "A1:C1", anchor: "A1", role: "anchor" },
             },
           ],
           truncated: false,
@@ -230,6 +292,30 @@ test("machine workbook validation rejects inconsistent structured fields", () =>
     },
     (result) => {
       result.workbook.selections[0].cells[0].richText = 1;
+    },
+    (result) => {
+      result.workbook.selections[0].cells[0].fontColor.tint = "light";
+    },
+    (result) => {
+      result.workbook.selections[0].cells[0].richTextRuns[0].strike = 1;
+    },
+    (result) => {
+      result.workbook.selections[0].overflow.right.maxColumn = 0;
+    },
+    (result) => {
+      result.workbook.selections[0].cells[0].merge.role = "merged";
+    },
+    (result) => {
+      result.workbook.sheets[0].print.pageSetup.fitToWidth = -1;
+    },
+    (result) => {
+      result.workbook.selections[0].images[0].sha256 = "not-a-hash";
+    },
+    (result) => {
+      result.workbook.selections[0].images[0].dataUri = "data:text/plain;base64,eA==";
+    },
+    (result) => {
+      result.workbook.selections[0].imagesTruncated = "no";
     },
   ]) {
     const result = validWorkbookResult();
