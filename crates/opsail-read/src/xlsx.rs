@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek};
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use std::time::SystemTime;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use quick_xml::Reader;
 use quick_xml::events::{BytesRef, BytesStart, Event};
@@ -22,6 +23,32 @@ const PREVIEW_GRID_MAX_AREA: u64 = 2_000;
 const MAX_CELL_TEXT_BYTES: usize = 32_767 * 4;
 const MAX_FEATURE_REFERENCES: usize = 10_000;
 const MAX_IMAGE_REFERENCES: usize = 256;
+
+/// Limits for the complete XLSX JSONL export used by document-view builders.
+///
+/// These limits deliberately differ from the bounded interactive preview: the
+/// exporter walks every physical cell element in every worksheet, including
+/// hidden sheets, and fails closed when a limit is exceeded.
+#[derive(Debug, Clone)]
+pub struct XlsxFullExportOptions {
+    pub max_cells: usize,
+    pub max_expanded_bytes: usize,
+    pub max_text_bytes: usize,
+    /// Optional controlled local directory for internal image exports.
+    pub assets_dir: Option<PathBuf>,
+}
+
+impl Default for XlsxFullExportOptions {
+    fn default() -> Self {
+        Self {
+            max_cells: 2_000_000,
+            max_expanded_bytes: 512 * 1024 * 1024,
+            max_text_bytes: 256 * 1024 * 1024,
+            assets_dir: None,
+        }
+    }
+
+}
 /// Raw image bytes are capped below the 16 MiB Host response ceiling. Base64
 /// expands the total to at most about 5.4 MiB, leaving room for cells and the
 /// duplicated Markdown/HTML evidence.
@@ -1147,6 +1174,62 @@ impl<R: Read + Seek> ArchiveReader<R> {
         }
         result
     }
+
+    fn stream_worksheet_cells<F>(
+        &mut self,
+        name: &str,
+        shared_strings: &[SharedString],
+        styles: &Styles,
+        date_system: DateSystem,
+        warnings: &mut Vec<String>,
+        emit: F,
+    ) -> Result<(), ReadError>
+    where
+        F: FnMut(WorkbookCell) -> Result<(), ReadError>,
+    {
+        let entry = self.archive.by_name(name).map_err(|error| match error {
+            ZipError::FileNotFound => {
+                ReadError::InvalidXlsx(format!("required OOXML part `{name}` is missing"))
+            }
+            other => invalid_zip(other),
+        })?;
+        if entry.is_dir() {
+            return Err(ReadError::InvalidXlsx(format!(
+                "OOXML part `{name}` is a directory"
+            )));
+        }
+        let remaining = self
+            .max_expanded_bytes
+            .checked_sub(self.expanded_bytes)
+            .ok_or(ReadError::SpreadsheetExpandedTooLarge {
+                limit: self.max_expanded_bytes,
+            })?;
+        let limit = u64::try_from(remaining)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let mut counted = CountingReader {
+            inner: entry.take(limit),
+            bytes_read: 0,
+        };
+        let result = parse_worksheet_full(
+            BufReader::new(&mut counted),
+            shared_strings,
+            styles,
+            date_system,
+            warnings,
+            emit,
+        );
+        let bytes_read = counted.bytes_read;
+        self.expanded_bytes = self
+            .expanded_bytes
+            .saturating_add(bytes_read.min(remaining));
+        if bytes_read > remaining {
+            return Err(ReadError::SpreadsheetExpandedTooLarge {
+                limit: self.max_expanded_bytes,
+            });
+        }
+        result
+    }
 }
 
 /// Read only ZIP central-directory revision metadata. No OOXML part is
@@ -1438,6 +1521,371 @@ pub(crate) fn read_xlsx(
     read_xlsx_with_context(path, options).map(|(result, _context)| result)
 }
 
+/// Stream every non-empty physical XLSX cell as JSONL.
+///
+/// Unlike [`read_xlsx`], this function never plans preview ranges and never
+/// expands a declared dimension.  A summary record is written only after all
+/// worksheet parts have been consumed successfully.  Callers must therefore
+/// treat a missing summary as an incomplete export.
+pub fn stream_xlsx_jsonl<W: Write>(
+    path: &Path,
+    output: &mut W,
+    options: XlsxFullExportOptions,
+) -> Result<(), ReadError> {
+    if options.max_cells == 0 || options.max_expanded_bytes == 0 || options.max_text_bytes == 0 {
+        return Err(ReadError::InvalidXlsx(
+            "full export limits must be greater than zero".to_owned(),
+        ));
+    }
+    let metadata = std::fs::metadata(path).map_err(|source| ReadError::ReadFile {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.is_file() {
+        return Err(ReadError::NotRegularFile {
+            path: path.to_path_buf(),
+        });
+    }
+    let file = File::open(path).map_err(|source| ReadError::ReadFile {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut package = ArchiveReader::new(file, options.max_expanded_bytes)?;
+    let content_types_xml = package.read_required_xml("[Content_Types].xml")?;
+    if !content_types_xml.contains(XLSX_CONTENT_TYPE) {
+        return Err(ReadError::InvalidXlsx(
+            "package does not declare an XLSX workbook content type".to_owned(),
+        ));
+    }
+    let content_types = parse_content_types(&content_types_xml)?;
+    let workbook_xml = package.read_required_xml("xl/workbook.xml")?;
+    validate_full_xml(&workbook_xml, "xl/workbook.xml")?;
+    let relationships_xml = package.read_required_xml("xl/_rels/workbook.xml.rels")?;
+    validate_full_xml(&relationships_xml, "xl/_rels/workbook.xml.rels")?;
+    let relationships = parse_relationships(&relationships_xml)?;
+    let workbook = parse_workbook(&workbook_xml, &relationships)?;
+    if workbook.sheets.is_empty() {
+        return Err(ReadError::InvalidXlsx(
+            "workbook contains no worksheets".to_owned(),
+        ));
+    }
+    let mut shared_strings = package
+        .read_xml("xl/sharedStrings.xml")?
+        .map(|xml| {
+            validate_full_xml(&xml, "xl/sharedStrings.xml")?;
+            parse_shared_strings(&xml, true)
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let mut styles = package
+        .read_xml("xl/styles.xml")?
+        .map(|xml| {
+            validate_full_xml(&xml, "xl/styles.xml")?;
+            parse_styles(&xml)
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let theme = package
+        .read_xml("xl/theme/theme1.xml")?
+        .map(|xml| {
+            validate_full_xml(&xml, "xl/theme/theme1.xml")?;
+            parse_theme_colors(&xml)
+        })
+        .transpose()?
+        .unwrap_or_default();
+    resolve_published_colors(&mut styles, &mut shared_strings, &theme);
+
+    let mut warnings = Vec::new();
+    let mut cell_count = 0usize;
+    let mut text_bytes = 0usize;
+    let mut stats = FullExportStats::default();
+    let assets_dir = options.assets_dir.as_deref().map(prepare_assets_dir).transpose()?;
+    write_jsonl(output, &json!({"type": "protocol", "version": 2}))?;
+    for descriptor in &workbook.sheets {
+        stats.sheets += 1;
+        write_jsonl(
+            output,
+            &json!({
+                "type": "sheet", "name": descriptor.name,
+                "hidden": descriptor.state != SheetState::Visible,
+                "sourceId": format!("xl/workbook.xml#{}", descriptor.path),
+            }),
+        )?;
+        package.stream_worksheet_cells(
+            &descriptor.path,
+            &shared_strings,
+            &styles,
+            workbook.date_system,
+            &mut warnings,
+            |cell| {
+                cell_count = cell_count.checked_add(1).ok_or_else(|| {
+                    ReadError::InvalidXlsx("full export cell count overflow".to_owned())
+                })?;
+                stats.cells += 1;
+                if cell_count > options.max_cells {
+                    return Err(ReadError::InvalidXlsx(format!(
+                        "full export exceeds max-cells limit {}",
+                        options.max_cells
+                    )));
+                }
+                text_bytes = text_bytes
+                    .saturating_add(cell.display.len())
+                    .saturating_add(cell.formula.as_ref().map_or(0, String::len));
+                if text_bytes > options.max_text_bytes {
+                    return Err(ReadError::InvalidXlsx(format!(
+                        "full export exceeds max-text-bytes limit {}",
+                        options.max_text_bytes
+                    )));
+                }
+                write_jsonl(
+                    output,
+                    &json!({
+                        "type": "cell", "sheet": descriptor.name, "cell": cell.reference,
+                        "text": cell.display, "formula": cell.formula,
+                        "cachedValue": cell.value, "valueType": cell.value_type,
+                        "fontStrike": cell.font_strike, "styleIndex": cell.style_index,
+                        "numberFormat": cell.number_format,
+                    }),
+                )
+            },
+        )?;
+        stream_sheet_annotations_and_assets(
+            &mut package, descriptor, &content_types, assets_dir.as_deref(), output, &mut stats, &mut text_bytes, options.max_text_bytes,
+        )?;
+    }
+    write_jsonl(
+        output,
+        &json!({
+            "type": "summary", "version": 2, "complete": true, "cellCount": cell_count,
+            "textBytes": text_bytes, "warnings": warnings,
+            "stats": {"sheets": stats.sheets, "cells": stats.cells, "comments": stats.comments,
+                "shapes": stats.shapes, "assets": stats.assets, "assetBytes": stats.asset_bytes},
+        }),
+    )?;
+    output.flush().map_err(output_error)
+}
+
+fn write_jsonl<W: Write>(output: &mut W, value: &Value) -> Result<(), ReadError> {
+    serde_json::to_writer(&mut *output, value).map_err(|error| {
+        ReadError::InvalidXlsx(format!("failed to serialize full export JSONL: {error}"))
+    })?;
+    output.write_all(b"\n").map_err(output_error)
+}
+
+fn output_error(error: std::io::Error) -> ReadError {
+    ReadError::InvalidXlsx(format!("failed to write full export: {error}"))
+}
+
+#[derive(Default)]
+struct FullExportStats { sheets: usize, cells: usize, comments: usize, shapes: usize, assets: usize, asset_bytes: usize }
+
+fn prepare_assets_dir(path: &Path) -> Result<PathBuf, ReadError> {
+    let absolute = if path.is_absolute() { path.to_path_buf() } else { std::env::current_dir().map_err(output_error)?.join(path) };
+    let mut prefix = PathBuf::new();
+    for component in absolute.components() {
+        prefix.push(component.as_os_str());
+        if let Ok(metadata) = std::fs::symlink_metadata(&prefix)
+            && metadata.file_type().is_symlink() {
+            return Err(ReadError::InvalidXlsx(format!("assets-dir ancestor `{}` is a symlink", prefix.display())));
+        }
+    }
+    std::fs::create_dir_all(path).map_err(|e| ReadError::InvalidXlsx(format!("cannot create assets directory: {e}")))?;
+    let metadata = std::fs::symlink_metadata(path).map_err(|e| ReadError::InvalidXlsx(format!("cannot inspect assets directory: {e}")))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() { return Err(ReadError::InvalidXlsx("assets-dir must be a real directory".to_owned())); }
+    std::fs::canonicalize(path).map_err(|e| ReadError::InvalidXlsx(format!("cannot canonicalize assets directory: {e}")))
+}
+
+fn anchor_json(marker: DrawingMarker) -> Value {
+    json!({"columnZeroBased": marker.column, "rowZeroBased": marker.row})
+}
+
+fn full_anchor_json(anchor: &FullDrawingAnchor) -> Value {
+    match anchor {
+        FullDrawingAnchor::Cells { from, to } => json!({"from": anchor_json(*from), "to": to.map(anchor_json)}),
+        FullDrawingAnchor::Absolute { x, y, cx, cy } => json!({"absoluteEmu": {"x": x, "y": y, "cx": cx, "cy": cy}}),
+    }
+}
+
+fn stream_sheet_annotations_and_assets<R: Read + Seek, W: Write>(
+    package: &mut ArchiveReader<R>, descriptor: &SheetDescriptor, content_types: &PackageContentTypes,
+    assets_dir: Option<&Path>, output: &mut W, stats: &mut FullExportStats, text_bytes: &mut usize, max_text_bytes: usize,
+) -> Result<(), ReadError> {
+    let rels = package.read_xml(&part_relationship_path(&descriptor.path)?)?
+        .map(|xml| parse_part_relationships(&xml)).transpose()?.unwrap_or_default();
+    for relationship in rels.values() {
+        if relationship.external { continue; }
+        let part = resolve_part_target(&descriptor.path, &relationship.target)?;
+        if relationship.relationship_type.ends_with("/comments") || relationship.relationship_type.ends_with("/threadedComment") {
+            {
+                let xml = package.read_xml(&part)?.ok_or_else(|| ReadError::InvalidXlsx(format!("referenced comment part `{part}` is missing")))?;
+                for comment in parse_full_comments(&xml, relationship.relationship_type.ends_with("/threadedComment"))? {
+                    count_full_text(text_bytes, max_text_bytes, &comment.text)?;
+                    stats.comments += 1;
+                    write_jsonl(output, &json!({"type":"comment", "sheet":descriptor.name, "cell":comment.cell,
+                        "text":comment.text, "author":comment.author, "kind":comment.kind, "sourceId":format!("{}#comment:{}", part, comment.index)}))?;
+                }
+            }
+        } else if relationship.relationship_type.ends_with("/drawing") {
+            {
+                let xml = package.read_xml(&part)?.ok_or_else(|| ReadError::InvalidXlsx(format!("referenced drawing part `{part}` is missing")))?;
+                let drawing_rels = package.read_xml(&part_relationship_path(&part)?)?
+                    .map(|value| parse_part_relationships(&value)).transpose()?.unwrap_or_default();
+                for object in parse_full_drawing_objects(&xml)? {
+                    if let Some(text) = object.textbox.filter(|text| !text.is_empty()) {
+                        count_full_text(text_bytes, max_text_bytes, &text)?;
+                        stats.shapes += 1;
+                        write_jsonl(output, &json!({"type":"shape", "sheet":descriptor.name, "kind":"drawingml-textbox",
+                            "anchor":full_anchor_json(&object.anchor), "text":text,
+                            "sourceId":format!("{}#shape:{}", part, object.shape_id.unwrap_or(object.index.to_string()))}))?;
+                    }
+                    if let Some(id) = object.image_relationship_id {
+                        let image_rel = drawing_rels.get(&id).ok_or_else(|| ReadError::InvalidXlsx(format!("drawing image relationship `{id}` is missing")))?;
+                        if image_rel.relationship_type.ends_with("/image") && !image_rel.external {
+                        let media_part = resolve_part_target(&part, &image_rel.target)?;
+                        if media_part.to_ascii_lowercase().contains("thumbnail") { continue; }
+                        {
+                            let bytes = package.read_bytes(&media_part)?.ok_or_else(|| ReadError::InvalidXlsx(format!("referenced image part `{media_part}` is missing")))?;
+                            let digest = digest(&SHA256, &bytes).as_ref().iter().map(|b| format!("{b:02x}")).collect::<String>();
+                            let mime = content_types.for_part(&media_part).unwrap_or_else(|| "application/octet-stream".to_owned());
+                            let exported = assets_dir.map(|dir| export_internal_asset(dir, &digest, &media_part, &bytes)).transpose()?;
+                            stats.assets += 1; stats.asset_bytes = stats.asset_bytes.saturating_add(bytes.len());
+                            write_jsonl(output, &json!({"type":"asset", "sheet":descriptor.name, "packagePart":media_part,
+                                "mimeType":mime, "sha256":digest, "byteSize":bytes.len(), "exportedPath":exported,
+                                "anchor":full_anchor_json(&object.anchor),
+                                "sourceId":format!("{}#anchor:{}", part, object.index)}))?;
+                        }
+                        }
+                    }
+                }
+            }
+        } else if relationship.relationship_type.ends_with("/vmlDrawing") {
+            {
+                let xml = package.read_xml(&part)?.ok_or_else(|| ReadError::InvalidXlsx(format!("referenced VML drawing part `{part}` is missing")))?;
+                for shape in parse_vml_textboxes(&xml)? {
+                    if shape.note || shape.text.is_empty() { continue; }
+                    count_full_text(text_bytes, max_text_bytes, &shape.text)?;
+                    stats.shapes += 1;
+                    write_jsonl(output, &json!({"type":"shape", "sheet":descriptor.name, "kind":"vml-textbox",
+                        "anchor":{"from":{"columnZeroBased":shape.column, "rowZeroBased":shape.row}}, "text":shape.text,
+                        "sourceId":format!("{}#shape:{}", part, shape.id)}))?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn count_full_text(total: &mut usize, limit: usize, text: &str) -> Result<(), ReadError> {
+    *total = total.checked_add(text.len()).ok_or_else(|| ReadError::InvalidXlsx("full export text byte count overflow".to_owned()))?;
+    if *total > limit { return Err(ReadError::InvalidXlsx(format!("full export exceeds max-text-bytes limit {limit}"))); }
+    Ok(())
+}
+
+fn export_internal_asset(dir: &Path, hash: &str, part: &str, bytes: &[u8]) -> Result<String, ReadError> {
+    let extension = part.rsplit('.').next().filter(|x| x.len() <= 16 && x.bytes().all(|b| b.is_ascii_alphanumeric())).unwrap_or("bin").to_ascii_lowercase();
+    let destination = dir.join(format!("{hash}.{extension}"));
+    if let Ok(metadata) = std::fs::symlink_metadata(&destination) {
+        if metadata.file_type().is_symlink() || !metadata.is_file() || digest(&SHA256, &std::fs::read(&destination).map_err(output_error)?).as_ref().iter().map(|b| format!("{b:02x}")).collect::<String>() != hash { return Err(ReadError::InvalidXlsx("asset destination conflicts with a different file".to_owned())); }
+    } else {
+        static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let mut temporary = None;
+        for _ in 0..32 {
+            let nonce = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let candidate = dir.join(format!(".{hash}.{}.{}.tmp", std::process::id(), nonce));
+            #[cfg(unix)] use std::os::unix::fs::OpenOptionsExt;
+            let mut options = OpenOptions::new(); options.write(true).create_new(true);
+            // Darwin O_NOFOLLOW.  This repository's native CLI target is macOS;
+            // create_new additionally prevents replacing a pre-existing name.
+            #[cfg(target_os = "macos")] { options.custom_flags(0x0000_0100); }
+            match options.open(&candidate) { Ok(mut file) => {
+                let result = (|| -> Result<(), ReadError> { file.write_all(bytes).map_err(output_error)?; file.sync_all().map_err(output_error)?; std::fs::rename(&candidate, &destination).map_err(output_error) })();
+                if result.is_err() { let _ = std::fs::remove_file(&candidate); }
+                result?; temporary = Some(candidate); break;
+            }, Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue, Err(e) => return Err(output_error(e)) }
+        }
+        if temporary.is_none() { return Err(ReadError::InvalidXlsx("could not allocate a safe asset temporary file".to_owned())); }
+    }
+    Ok(destination.display().to_string())
+}
+
+struct FullComment { cell: String, text: String, author: Option<String>, kind: &'static str, index: usize }
+fn parse_full_comments(xml: &str, threaded: bool) -> Result<Vec<FullComment>, ReadError> {
+    validate_full_xml(xml, "comment part")?;
+    let mut reader = xml_reader(xml); let mut result = Vec::new(); let mut current: Option<FullComment> = None; let mut in_text = false;
+    loop { match reader.read_event().map_err(xml_error)? {
+        Event::Start(e) if local_name(e.name().as_ref()) == b"comment" || local_name(e.name().as_ref()) == b"threadedComment" => {
+            current = Some(FullComment { cell: attribute(&e,b"ref")?.unwrap_or_default(), text:String::new(), author:attribute(&e,b"authorId")?.or(attribute(&e,b"personId")?), kind:if threaded{"threaded"}else{"comment"}, index:result.len() }); }
+        Event::Start(e) if current.is_some() && matches!(local_name(e.name().as_ref()), b"t" | b"text") => in_text=true,
+        Event::Text(t) if in_text => if let Some(c)=current.as_mut(){c.text.push_str(&t.decode().map_err(encoding_error)?);},
+        Event::GeneralRef(entity) if in_text => if let Some(c)=current.as_mut(){c.text.push_str(&decode_reference(&entity)?);},
+        Event::End(e) if matches!(local_name(e.name().as_ref()), b"t" | b"text") => in_text=false,
+        Event::End(e) if local_name(e.name().as_ref()) == b"comment" || local_name(e.name().as_ref()) == b"threadedComment" => if let Some(c)=current.take(){ if !c.cell.is_empty(){result.push(c)}},
+        Event::Eof => break, _=>{}
+    }} Ok(result)
+}
+
+#[derive(Clone)]
+enum FullDrawingAnchor {
+    Cells { from: DrawingMarker, to: Option<DrawingMarker> },
+    Absolute { x: Option<i64>, y: Option<i64>, cx: Option<i64>, cy: Option<i64> },
+}
+impl Default for FullDrawingAnchor { fn default() -> Self { Self::Cells { from: DrawingMarker::default(), to: None } } }
+#[derive(Default)]
+struct FullDrawingObject { anchor: FullDrawingAnchor, textbox: Option<String>, image_relationship_id: Option<String>, shape_id: Option<String>, index: usize }
+fn parse_full_drawing_objects(xml: &str) -> Result<Vec<FullDrawingObject>, ReadError> {
+    validate_full_xml(xml, "drawing part")?;
+    let mut reader=xml_reader(xml); let mut all=Vec::new(); let mut anchor:Option<FullDrawingAnchor>=None;
+    let mut marker:Option<(bool,Option<bool>)>=None;
+    let mut shapes: Vec<FullDrawingObject>=Vec::new(); let mut text_depth=0usize;
+    loop { match reader.read_event().map_err(xml_error)? {
+        Event::Start(e) if matches!(local_name(e.name().as_ref()),b"twoCellAnchor"|b"oneCellAnchor") => anchor=Some(FullDrawingAnchor::default()),
+        Event::Start(e) if local_name(e.name().as_ref())==b"absoluteAnchor" => anchor=Some(FullDrawingAnchor::Absolute{x:None,y:None,cx:None,cy:None}),
+        Event::Start(e) if anchor.is_some() && local_name(e.name().as_ref())==b"from" => marker=Some((true,None)),
+        Event::Start(e) if anchor.is_some() && local_name(e.name().as_ref())==b"to" => marker=Some((false,None)),
+        Event::Start(e) if marker.is_some() && local_name(e.name().as_ref())==b"row" => marker.as_mut().unwrap().1=Some(true),
+        Event::Start(e) if marker.is_some() && local_name(e.name().as_ref())==b"col" => marker.as_mut().unwrap().1=Some(false),
+        Event::Start(e)|Event::Empty(e) if matches!(local_name(e.name().as_ref()),b"pos"|b"ext") && matches!(&anchor,Some(FullDrawingAnchor::Absolute{..})) => {
+            let target=anchor.as_mut().unwrap(); let x=attribute(&e,b"x")?.and_then(|v|v.parse().ok()); let y=attribute(&e,b"y")?.and_then(|v|v.parse().ok()); let cx=attribute(&e,b"cx")?.and_then(|v|v.parse().ok()); let cy=attribute(&e,b"cy")?.and_then(|v|v.parse().ok());
+            if let FullDrawingAnchor::Absolute{x:ax,y:ay,cx:acx,cy:acy}=target {*ax=x.or(*ax);*ay=y.or(*ay);*acx=cx.or(*acx);*acy=cy.or(*acy);}
+        },
+        Event::Text(t) if anchor.is_some() && marker.as_ref().is_some_and(|(_,field)| field.is_some()) => { if let Ok(v)=t.decode().map_err(encoding_error)?.trim().parse::<u32>() { let Some((from,Some(row)))=marker else { unreachable!() }; if let FullDrawingAnchor::Cells{from: start,to}=anchor.as_mut().unwrap(){let m=if from{start}else{to.get_or_insert_default()}; if row{m.row=Some(v)}else{m.column=Some(v)}} }},
+        Event::Start(e) if anchor.is_some() && local_name(e.name().as_ref())==b"sp" => shapes.push(FullDrawingObject{anchor:anchor.as_ref().unwrap().clone(),index:all.len()+shapes.len(),..Default::default()}),
+        Event::Start(e)|Event::Empty(e) if !shapes.is_empty() && local_name(e.name().as_ref())==b"cNvPr" => shapes.last_mut().unwrap().shape_id=attribute(&e,b"id")?,
+        Event::Start(e) if !shapes.is_empty() && local_name(e.name().as_ref())==b"t" => text_depth+=1,
+        Event::Start(e)|Event::Empty(e) if !shapes.is_empty() && local_name(e.name().as_ref())==b"br" => shapes.last_mut().unwrap().textbox.get_or_insert_default().push('\n'),
+        Event::Start(e)|Event::Empty(e) if !shapes.is_empty() && local_name(e.name().as_ref())==b"tab" => shapes.last_mut().unwrap().textbox.get_or_insert_default().push('\t'),
+        Event::Text(t) if text_depth>0 => shapes.last_mut().unwrap().textbox.get_or_insert_default().push_str(&t.decode().map_err(encoding_error)?),
+        Event::GeneralRef(entity) if text_depth>0 => shapes.last_mut().unwrap().textbox.get_or_insert_default().push_str(&decode_reference(&entity)?),
+        Event::End(e) if local_name(e.name().as_ref())==b"t" && text_depth>0 => text_depth-=1,
+        Event::End(e) if !shapes.is_empty() && local_name(e.name().as_ref())==b"p" => shapes.last_mut().unwrap().textbox.get_or_insert_default().push('\n'),
+        Event::Start(e)|Event::Empty(e) if anchor.is_some() && local_name(e.name().as_ref())==b"blip" => all.push(FullDrawingObject{anchor:anchor.as_ref().unwrap().clone(),image_relationship_id:attribute_exact(&e,b"r:embed")?,index:all.len()+shapes.len(),..Default::default()}),
+        Event::End(e) if local_name(e.name().as_ref())==b"sp" => if let Some(mut shape)=shapes.pop(){if let Some(t)=shape.textbox.as_mut(){while t.ends_with('\n'){t.pop();}} all.push(shape)},
+        Event::End(e) if matches!(local_name(e.name().as_ref()),b"twoCellAnchor"|b"oneCellAnchor"|b"absoluteAnchor") => { anchor=None; shapes.clear(); },
+        Event::End(e) if matches!(local_name(e.name().as_ref()),b"row"|b"col") => if let Some((_, field))=marker.as_mut(){*field=None},
+        Event::End(e) if matches!(local_name(e.name().as_ref()),b"from"|b"to") => marker=None,
+        Event::Eof=>break, _=>{}
+    }} Ok(all)
+}
+
+struct VmlTextbox { id: String, text: String, row: Option<u32>, column: Option<u32>, note: bool }
+fn parse_vml_textboxes(xml: &str) -> Result<Vec<VmlTextbox>, ReadError> {
+    validate_full_xml(xml, "VML drawing part")?; let mut reader=xml_reader(xml); let mut all=Vec::new(); let mut current:Option<VmlTextbox>=None; let mut in_textbox=false; let mut field:Option<bool>=None;
+    loop { match reader.read_event().map_err(xml_error)? {
+        Event::Start(e) if local_name(e.name().as_ref())==b"shape" => current=Some(VmlTextbox{id:attribute(&e,b"id")?.unwrap_or_else(|| format!("vml-{}",all.len())),text:String::new(),row:None,column:None,note:false}),
+        Event::Start(e) if current.is_some() && local_name(e.name().as_ref())==b"textbox" => in_textbox=true,
+        Event::Start(e)|Event::Empty(e) if current.is_some() && local_name(e.name().as_ref())==b"ClientData" => current.as_mut().unwrap().note=attribute(&e,b"ObjectType")?.as_deref().is_some_and(|v|v.eq_ignore_ascii_case("Note")),
+        Event::Start(e) if current.is_some() && local_name(e.name().as_ref())==b"Row" => field=Some(true),
+        Event::Start(e) if current.is_some() && local_name(e.name().as_ref())==b"Column" => field=Some(false),
+        Event::Text(t) if current.is_some() && field.is_some() => if let Ok(v)=t.decode().map_err(encoding_error)?.trim().parse(){if field==Some(true){current.as_mut().unwrap().row=Some(v)}else{current.as_mut().unwrap().column=Some(v)}},
+        Event::Text(t) if in_textbox => current.as_mut().unwrap().text.push_str(&t.decode().map_err(encoding_error)?),
+        Event::GeneralRef(entity) if in_textbox => current.as_mut().unwrap().text.push_str(&decode_reference(&entity)?),
+        Event::End(e) if matches!(local_name(e.name().as_ref()),b"Row"|b"Column") => field=None,
+        Event::End(e) if local_name(e.name().as_ref())==b"textbox" => in_textbox=false,
+        Event::End(e) if local_name(e.name().as_ref())==b"shape" => if let Some(shape)=current.take(){all.push(shape)},
+        Event::Eof=>break, _=>{}
+    }} Ok(all)
+}
+
 fn read_xlsx_with_context(
     path: PathBuf,
     options: &ReadOptions,
@@ -1507,7 +1955,7 @@ fn read_xlsx_with_context(
     } else {
         let mut shared_strings = package
             .read_xml("xl/sharedStrings.xml")?
-            .map(|xml| parse_shared_strings(&xml))
+            .map(|xml| parse_shared_strings(&xml, false))
             .transpose()?
             .unwrap_or_default();
         let mut styles = package
@@ -2316,7 +2764,7 @@ fn apply_worksheet_print_scan(target: &mut WorksheetPrintEvidence, scan: Workshe
     target.header_footer = scan.header_footer;
 }
 
-fn parse_shared_strings(xml: &str) -> Result<Vec<SharedString>, ReadError> {
+fn parse_shared_strings(xml: &str, strict: bool) -> Result<Vec<SharedString>, ReadError> {
     let mut reader = xml_reader(xml);
     let mut strings = Vec::new();
     let mut current: Option<String> = None;
@@ -2371,17 +2819,18 @@ fn parse_shared_strings(xml: &str) -> Result<Vec<SharedString>, ReadError> {
             Event::Text(text) if inside_text => {
                 if let Some(value) = current.as_mut() {
                     let decoded = text.decode().map_err(encoding_error)?;
-                    push_bounded(value, &decoded);
+                    push_cell_text(value, &decoded, strict)?;
                     if let Some(run) = run.as_mut() {
-                        push_bounded(&mut run.text, &decoded);
+                        push_cell_text(&mut run.text, &decoded, strict)?;
                     }
                 }
             }
             Event::GeneralRef(entity) if inside_text => {
                 if let Some(value) = current.as_mut() {
-                    push_bounded(value, &decode_reference(&entity)?);
+                    let decoded = decode_reference(&entity)?;
+                    push_cell_text(value, &decoded, strict)?;
                     if let Some(run) = run.as_mut() {
-                        push_bounded(&mut run.text, &decode_reference(&entity)?);
+                        push_cell_text(&mut run.text, &decoded, strict)?;
                     }
                 }
             }
@@ -2680,6 +3129,202 @@ fn apply_tint(rgb: &str, tint: f64) -> Option<String> {
         ((g1 + m) * 255.0).round() as u8,
         ((b1 + m) * 255.0).round() as u8
     ))
+}
+
+/// Parse cell bodies in source order without applying preview selections.
+fn parse_worksheet_full<R: BufRead, F: FnMut(WorkbookCell) -> Result<(), ReadError>>(
+    input: R,
+    shared_strings: &[SharedString],
+    styles: &Styles,
+    date_system: DateSystem,
+    warnings: &mut Vec<String>,
+    mut emit: F,
+) -> Result<(), ReadError> {
+    let mut reader = Reader::from_reader(input);
+    reader.config_mut().trim_text(false);
+    let mut buffer = Vec::new();
+    let mut cell: Option<CellBuilder> = None;
+    let mut phonetic_depth = 0usize;
+    let mut xml_depth = 0usize;
+    loop {
+        let event = reader.read_event_into(&mut buffer).map_err(xml_error)?;
+        match &event {
+            Event::Start(_) => {
+                xml_depth = xml_depth.checked_add(1).ok_or_else(|| {
+                    ReadError::InvalidXlsx("full export worksheet XML nesting overflow".to_owned())
+                })?;
+            }
+            Event::End(_) => {
+                xml_depth = xml_depth.checked_sub(1).ok_or_else(|| {
+                    ReadError::InvalidXlsx(
+                        "full export worksheet XML has an unmatched end tag".to_owned(),
+                    )
+                })?;
+            }
+            Event::CData(_) => {
+                return Err(ReadError::InvalidXlsx(
+                    "full export does not support CDATA in worksheet XML".to_owned(),
+                ));
+            }
+            Event::Eof if xml_depth != 0 || cell.is_some() => {
+                return Err(ReadError::InvalidXlsx(
+                    "full export worksheet XML is truncated or unclosed".to_owned(),
+                ));
+            }
+            _ => {}
+        }
+        match event {
+            Event::Start(element) if local_name(element.name().as_ref()) == b"c" => {
+                cell = Some(CellBuilder {
+                    reference: attribute(&element, b"r")?.unwrap_or_default(),
+                    cell_type: attribute(&element, b"t")?,
+                    style_index: attribute(&element, b"s")?.and_then(|value| value.parse().ok()),
+                    ..CellBuilder::default()
+                });
+            }
+            Event::Start(element) if local_name(element.name().as_ref()) == b"v" => {
+                if let Some(cell) = cell.as_mut() {
+                    cell.capture_value = true;
+                    cell.has_value = true;
+                }
+            }
+            Event::Start(element) if local_name(element.name().as_ref()) == b"f" => {
+                if let Some(cell) = cell.as_mut() {
+                    cell.capture_formula = true;
+                    cell.has_formula = true;
+                    capture_formula_metadata(cell, &element)?;
+                }
+            }
+            Event::Empty(element) if local_name(element.name().as_ref()) == b"f" => {
+                if let Some(cell) = cell.as_mut() {
+                    cell.has_formula = true;
+                    capture_formula_metadata(cell, &element)?;
+                }
+            }
+            Event::Start(element) if local_name(element.name().as_ref()) == b"t" => {
+                if let Some(cell) = cell.as_mut()
+                    && cell.cell_type.as_deref() == Some("inlineStr")
+                {
+                    cell.capture_inline_text = true;
+                    cell.has_inline = true;
+                }
+            }
+            Event::Start(element) if local_name(element.name().as_ref()) == b"r" => {
+                if let Some(cell) = cell.as_mut()
+                    && cell.cell_type.as_deref() == Some("inlineStr")
+                {
+                    cell.rich_text = true;
+                    cell.current_run = Some(WorkbookRichTextRun::default());
+                }
+            }
+            Event::Start(element) if local_name(element.name().as_ref()) == b"rPr" => {
+                if let Some(cell) = cell.as_mut()
+                    && cell.current_run.is_some()
+                {
+                    cell.inside_run_properties = true;
+                }
+            }
+            Event::Start(element) | Event::Empty(element)
+                if local_name(element.name().as_ref()) == b"strike" =>
+            {
+                if let Some(cell) = cell.as_mut()
+                    && cell.inside_run_properties
+                    && let Some(run) = cell.current_run.as_mut()
+                {
+                    run.strike = Some(
+                        attribute(&element, b"val")?
+                            .as_deref()
+                            .is_none_or(xml_truthy),
+                    );
+                }
+            }
+            Event::Start(element) | Event::Empty(element)
+                if local_name(element.name().as_ref()) == b"color" =>
+            {
+                if let Some(cell) = cell.as_mut()
+                    && cell.inside_run_properties
+                    && let Some(run) = cell.current_run.as_mut()
+                {
+                    run.font_color = parse_font_color(&element)?;
+                }
+            }
+            Event::Start(element) if local_name(element.name().as_ref()) == b"rPh" => {
+                phonetic_depth += 1
+            }
+            Event::Text(text) if phonetic_depth == 0 => {
+                let text = text.decode().map_err(encoding_error)?;
+                if let Some(cell) = cell.as_mut() {
+                    if cell.capture_value {
+                        push_cell_text(&mut cell.value, &text, true)?;
+                    } else if cell.capture_formula {
+                        push_cell_text(&mut cell.formula, &text, true)?;
+                    } else if cell.capture_inline_text {
+                        push_cell_text(&mut cell.inline, &text, true)?;
+                        if let Some(run) = cell.current_run.as_mut() {
+                            push_cell_text(&mut run.text, &text, true)?;
+                        }
+                    }
+                }
+            }
+            Event::GeneralRef(entity) if phonetic_depth == 0 => {
+                let text = decode_reference(&entity)?;
+                if let Some(cell) = cell.as_mut() {
+                    if cell.capture_value {
+                        push_cell_text(&mut cell.value, &text, true)?;
+                    } else if cell.capture_formula {
+                        push_cell_text(&mut cell.formula, &text, true)?;
+                    } else if cell.capture_inline_text {
+                        push_cell_text(&mut cell.inline, &text, true)?;
+                        if let Some(run) = cell.current_run.as_mut() {
+                            push_cell_text(&mut run.text, &text, true)?;
+                        }
+                    }
+                }
+            }
+            Event::End(element) if local_name(element.name().as_ref()) == b"v" => {
+                if let Some(cell) = cell.as_mut() {
+                    cell.capture_value = false;
+                }
+            }
+            Event::End(element) if local_name(element.name().as_ref()) == b"f" => {
+                if let Some(cell) = cell.as_mut() {
+                    cell.capture_formula = false;
+                }
+            }
+            Event::End(element) if local_name(element.name().as_ref()) == b"t" => {
+                if let Some(cell) = cell.as_mut() {
+                    cell.capture_inline_text = false;
+                }
+            }
+            Event::End(element) if local_name(element.name().as_ref()) == b"rPh" => {
+                phonetic_depth = phonetic_depth.saturating_sub(1)
+            }
+            Event::End(element) if local_name(element.name().as_ref()) == b"rPr" => {
+                if let Some(cell) = cell.as_mut() {
+                    cell.inside_run_properties = false;
+                }
+            }
+            Event::End(element) if local_name(element.name().as_ref()) == b"r" => {
+                if let Some(cell) = cell.as_mut()
+                    && let Some(run) = cell.current_run.take()
+                {
+                    cell.rich_text_runs.push(run);
+                }
+            }
+            Event::End(element) if local_name(element.name().as_ref()) == b"c" => {
+                if let Some(builder) = cell.take()
+                    && let Some(parsed) =
+                        finish_cell(builder, shared_strings, styles, date_system, true, warnings)?
+                {
+                    emit(parsed)?;
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buffer.clear();
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4604,6 +5249,61 @@ fn push_bounded(target: &mut String, value: &str) {
         boundary -= 1;
     }
     target.push_str(&value[..boundary]);
+}
+
+fn push_cell_text(target: &mut String, value: &str, strict: bool) -> Result<(), ReadError> {
+    if !strict {
+        push_bounded(target, value);
+        return Ok(());
+    }
+    let size = target.len().checked_add(value.len()).ok_or_else(|| {
+        ReadError::InvalidXlsx("full export cell text length overflow".to_owned())
+    })?;
+    if size > MAX_CELL_TEXT_BYTES {
+        return Err(ReadError::InvalidXlsx(format!(
+            "full export cell or shared-string text exceeds {MAX_CELL_TEXT_BYTES} byte limit"
+        )));
+    }
+    target.push_str(value);
+    Ok(())
+}
+
+/// Full export fails closed on syntactically incomplete XML.  The interactive
+/// reader intentionally has more tolerant, bounded behavior and does not use
+/// this validator.
+fn validate_full_xml(xml: &str, part: &str) -> Result<(), ReadError> {
+    let mut reader = xml_reader(xml);
+    let mut depth = 0usize;
+    loop {
+        match reader.read_event().map_err(xml_error)? {
+            Event::Start(_) => {
+                depth = depth.checked_add(1).ok_or_else(|| {
+                    ReadError::InvalidXlsx(format!("full export XML nesting overflow in `{part}`"))
+                })?
+            }
+            Event::End(_) => {
+                depth = depth.checked_sub(1).ok_or_else(|| {
+                    ReadError::InvalidXlsx(format!(
+                        "full export XML has an unmatched end tag in `{part}`"
+                    ))
+                })?;
+            }
+            Event::CData(_) => {
+                return Err(ReadError::InvalidXlsx(format!(
+                    "full export does not support CDATA in `{part}`"
+                )));
+            }
+            Event::Eof => {
+                if depth != 0 {
+                    return Err(ReadError::InvalidXlsx(format!(
+                        "full export XML is truncated or unclosed in `{part}`"
+                    )));
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
 }
 
 fn invalid_range(selector: &str, reason: &str) -> ReadError {

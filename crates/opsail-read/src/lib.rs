@@ -34,7 +34,8 @@ pub use xlsx::{
     WorkbookRichTextRun, WorkbookRowOverflow, WorkbookSelection, WorkbookSelectionOverflow,
     WorkbookSession, WorkbookSessionMetrics, WorkbookSessionRefresh, WorkbookSheet,
     WorkbookStatistics, WorksheetFeatureInventory, WorksheetPageSetup, WorksheetPrintEvidence,
-    WorksheetPrintOptions, inspect_workbook_revision, merge_markdown_mirror,
+    WorksheetPrintOptions, XlsxFullExportOptions, inspect_workbook_revision, merge_markdown_mirror,
+    stream_xlsx_jsonl,
 };
 
 /// Auto-detect and read a supported document artifact.

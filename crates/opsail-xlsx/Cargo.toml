@@ -1,0 +1,21 @@
+[package]
+name = "opsail-xlsx"
+description = "Conservative OOXML XLSX inspection and candidate patching"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+quick-xml.workspace = true
+ring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+zip.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

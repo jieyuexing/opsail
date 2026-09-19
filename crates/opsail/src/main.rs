@@ -19,6 +19,8 @@ mod activity;
 mod codex;
 mod machine;
 mod usage;
+mod view;
+mod xlsx;
 
 const PROPERTY_NAMES: &str = "content, markdown, contentHtml, html, title, author, description, site, published, modified, image, favicon, language, direction, url, canonicalUrl, domain, wordCount, quality, source, extraction, revision, workbook, sheets, selections, definedNames, features, statistics, metrics";
 
@@ -49,6 +51,10 @@ enum Command {
     Usage(usage::UsageArgs),
     /// Apply a reversible, target-validated application refit.
     Refit(RefitArgs),
+    /// Export complete XLSX cell data for document-view builders.
+    View(view::ViewArgs),
+    /// Inspect stored XLSX formatting, create a bounded patch candidate, or compare workbooks.
+    Xlsx(xlsx::XlsxArgs),
 }
 
 #[derive(Debug, Args)]
@@ -272,6 +278,7 @@ async fn async_main() -> ExitCode {
 async fn execute(command: Command) -> ExitCode {
     match command {
         Command::Read(args) if args.machine => machine::run().await,
+        Command::Xlsx(args) => xlsx::run(args).await,
         command => match run(command).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
@@ -382,6 +389,8 @@ async fn run(command: Command) -> Result<()> {
         Command::Read(args) => run_read(*args).await,
         Command::Usage(args) => usage::run(args).await,
         Command::Refit(args) => run_refit(args).await,
+        Command::View(args) => view::run(args).await,
+        Command::Xlsx(_) => unreachable!("XLSX commands return their own structured exit status"),
     }
 }
 
