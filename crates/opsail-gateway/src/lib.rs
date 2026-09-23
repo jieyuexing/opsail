@@ -42,6 +42,10 @@ pub async fn execute(
             let summary = vault.set(&passphrase, connection)?;
             Ok(json!(summary))
         }
+        GatewayRequest::SetDefaultModel { name, model } => {
+            let summary = vault.set_default_model(&passphrase, &name, model)?;
+            Ok(json!(summary))
+        }
         GatewayRequest::Remove { name } => {
             vault.remove(&passphrase, &name)?;
             Ok(json!({"removed":true}))

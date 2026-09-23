@@ -58,6 +58,22 @@ fn vault_roundtrip_rekey_and_failed_unlock_preserve_ciphertext() {
     let list = vault.list(&password()).unwrap();
     assert_eq!(list.len(), 1);
     assert!(list[0].has_key);
+    let changed = vault
+        .set_default_model(&password(), "test", Some("fixture-flash".into()))
+        .unwrap();
+    assert_eq!(changed.default_model.as_deref(), Some("fixture-flash"));
+    assert_eq!(
+        vault.get(&password(), "test").unwrap().auth.key(),
+        Some("fixture-api-key")
+    );
+    assert_eq!(
+        vault
+            .set_default_model(&password(), "missing", None)
+            .unwrap_err()
+            .code,
+        "connection-not-found"
+    );
+    let before = fs::read(vault.path()).unwrap();
     assert!(
         !serde_json::to_string(&list)
             .unwrap()

@@ -104,6 +104,26 @@ impl Vault {
         Ok(summary)
     }
 
+    /// Replace only the default model; the stored credential and endpoint are kept.
+    pub fn set_default_model(
+        &self,
+        passphrase: &Secret,
+        name: &str,
+        model: Option<String>,
+    ) -> Result<ConnectionSummary, GatewayError> {
+        let _lock = self.lock(false)?;
+        let mut contents = self.read(passphrase)?;
+        let connection = contents
+            .connections
+            .get_mut(name)
+            .ok_or_else(missing_connection)?;
+        connection.default_model = model;
+        validate_connection(connection)?;
+        let summary = ConnectionSummary::from(&*connection);
+        self.write(&contents, passphrase)?;
+        Ok(summary)
+    }
+
     pub fn remove(&self, passphrase: &Secret, name: &str) -> Result<(), GatewayError> {
         let _lock = self.lock(false)?;
         let mut contents = self.read(passphrase)?;

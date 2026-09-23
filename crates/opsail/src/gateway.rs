@@ -81,6 +81,11 @@ enum ConnectionCommand {
     Remove {
         name: String,
     },
+    /// Change a connection's default model, keeping its key. Omit MODEL to clear it.
+    Model {
+        name: String,
+        model: Option<String>,
+    },
     /// Save a complete connection. Key and vault passphrase are entered with a masked prompt.
     Set {
         name: String,
@@ -187,6 +192,9 @@ async fn human_request(command: Option<GatewayCommand>) -> Result<Envelope, Gate
         GatewayCommand::Connection { command } => match command {
             ConnectionCommand::List => GatewayRequest::List,
             ConnectionCommand::Remove { name } => GatewayRequest::Remove { name },
+            ConnectionCommand::Model { name, model } => {
+                GatewayRequest::SetDefaultModel { name, model }
+            }
             ConnectionCommand::Set {
                 name,
                 base_url,
