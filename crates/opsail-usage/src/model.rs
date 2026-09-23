@@ -39,7 +39,10 @@ pub struct UsageOptions {
     pub claude_auth_path: Option<PathBuf>,
     pub timeout: Duration,
     pub client: ClientInfo,
+    #[cfg(test)]
     pub(crate) grok_endpoint: Option<String>,
+    #[cfg(test)]
+    pub(crate) grok_fallback_endpoint: Option<String>,
     #[cfg(test)]
     pub(crate) claude_endpoint: Option<String>,
 }
@@ -53,7 +56,10 @@ impl Default for UsageOptions {
             claude_auth_path: None,
             timeout: DEFAULT_TIMEOUT,
             client: ClientInfo::default(),
+            #[cfg(test)]
             grok_endpoint: None,
+            #[cfg(test)]
+            grok_fallback_endpoint: None,
             #[cfg(test)]
             claude_endpoint: None,
         }

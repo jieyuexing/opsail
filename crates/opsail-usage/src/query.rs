@@ -369,7 +369,8 @@ write_frame({
             claude_auth_path: Some(claude_auth),
             claude_endpoint: Some(format!("{}/api/oauth/usage", server.uri())),
             timeout: Duration::from_millis(100),
-            grok_endpoint: Some(format!(
+            grok_endpoint: Some(format!("{}/v1/billing?format=credits", server.uri())),
+            grok_fallback_endpoint: Some(format!(
                 "{}/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig",
                 server.uri()
             )),

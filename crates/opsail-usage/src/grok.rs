@@ -6,11 +6,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use futures_util::StreamExt;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::AsyncReadExt;
 
 use crate::model::{UsageEntry, UsageOptions, UsageProvider, UsageSnapshot};
 
 const BILLING_ENDPOINT: &str = "https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig";
+const CLI_BILLING_ENDPOINT: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
+const LOGIN_REQUIRED: &str = "Grok sign-in is no longer valid; run `grok login`";
+const CLOUDFLARE_BLOCKED: &str = "Grok 计费接口被 Cloudflare 拦截（非登录问题）";
+const UNAVAILABLE: &str = "the Grok billing endpoint is temporarily unavailable";
+const UNRECOGNIZED: &str = "the Grok billing response was not recognized";
 const OIDC_SCOPE_PREFIX: &str = "https://auth.x.ai::";
 const LEGACY_SESSION_SCOPE: &str = "https://accounts.x.ai/sign-in";
 const EMPTY_GRPC_WEB_FRAME: [u8; 5] = [0, 0, 0, 0, 0];
@@ -51,8 +57,10 @@ pub(crate) async fn read_grok_usage(options: &UsageOptions) -> UsageEntry {
         Ok(auth) => auth,
         Err(detail) => return UsageEntry::unavailable(UsageProvider::Grok, detail),
     };
-    let endpoint = options.grok_endpoint.as_deref().unwrap_or(BILLING_ENDPOINT);
-    match query_billing(endpoint, &auth, options).await {
+    if auth.expired {
+        return UsageEntry::unavailable(UsageProvider::Grok, LOGIN_REQUIRED);
+    }
+    match query_billing(&auth, options).await {
         Ok(snapshot) => UsageEntry::from_grok(snapshot),
         Err(detail) => UsageEntry::unavailable(UsageProvider::Grok, detail),
     }
@@ -169,7 +177,7 @@ fn parse_grok_auth(content: &str, now_ms: u64) -> Result<GrokAuth, String> {
     let expired = expires_at
         .as_deref()
         .and_then(parse_rfc3339_millis)
-        .is_some_and(|expires| expires < now_ms);
+        .is_some_and(|expires| expires <= now_ms);
     Ok(GrokAuth {
         token: GrokToken(key),
         expired,
@@ -177,63 +185,90 @@ fn parse_grok_auth(content: &str, now_ms: u64) -> Result<GrokAuth, String> {
 }
 
 fn parse_rfc3339_millis(value: &str) -> Option<u64> {
-    let value = value.trim();
-    let (date, time_and_offset) = value.split_once('T')?;
-    let time = time_and_offset
-        .trim_end_matches('Z')
-        .split(['+', '-'])
-        .next()
-        .unwrap_or(time_and_offset);
-    let time = time.split('.').next()?;
-    let mut date_parts = date.split('-');
-    let year: i64 = date_parts.next()?.parse().ok()?;
-    let month: u32 = date_parts.next()?.parse().ok()?;
-    let day: u32 = date_parts.next()?.parse().ok()?;
-    let mut time_parts = time.split(':');
-    let hour: u64 = time_parts.next()?.parse().ok()?;
-    let minute: u64 = time_parts.next()?.parse().ok()?;
-    let second: u64 = time_parts.next()?.parse().ok()?;
-    let days = days_from_civil(year, month, day)?;
-    let secs = days * 86_400 + hour as i64 * 3_600 + minute as i64 * 60 + second as i64;
-    Some(u64::try_from(secs.max(0)).ok()? * 1_000)
+    let date = OffsetDateTime::parse(value, &Rfc3339).ok()?;
+    u64::try_from(date.unix_timestamp_nanos() / 1_000_000).ok()
 }
 
-fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
-    if !(1..=12).contains(&month) || day == 0 || day > 31 {
-        return None;
-    }
-    let year = if month <= 2 { year - 1 } else { year };
-    let era = if year >= 0 { year } else { year - 399 } / 400;
-    let yoe = year - era * 400;
-    let month_i = i64::from(month);
-    let day_i = i64::from(day);
-    let doy = (153 * (month_i + if month > 2 { -3 } else { 9 }) + 2) / 5 + day_i - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    Some(era * 146_097 + doe - 719_468)
-}
-
-async fn query_billing(
-    endpoint: &str,
-    auth: &GrokAuth,
-    options: &UsageOptions,
-) -> Result<UsageSnapshot, String> {
+async fn query_billing(auth: &GrokAuth, options: &UsageOptions) -> Result<UsageSnapshot, String> {
     INSTALL_TLS.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
-    let user_agent = format!("{}/{}", options.client.name, options.client.version);
     let client = reqwest::Client::builder()
         .timeout(options.timeout)
         .connect_timeout(options.timeout.min(std::time::Duration::from_secs(8)))
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .map_err(|_| unreachable_billing(auth.expired))?;
+        .map_err(|_| UNAVAILABLE.to_owned())?;
 
+    let endpoint = CLI_BILLING_ENDPOINT;
+    let fallback = BILLING_ENDPOINT;
+    #[cfg(test)]
+    let endpoint = options.grok_endpoint.as_deref().unwrap_or(endpoint);
+    #[cfg(test)]
+    let fallback = options
+        .grok_fallback_endpoint
+        .as_deref()
+        .unwrap_or(fallback);
+
+    // Leave room for the legacy read within the provider's shared deadline.
+    let primary = query_cli_billing(&client, endpoint, auth, options).await;
+    match primary {
+        Ok(snapshot) => Ok(snapshot),
+        Err(detail) if detail == LOGIN_REQUIRED => Err(detail),
+        Err(primary_detail) => {
+            match query_browser_billing(&client, fallback, auth, options).await {
+                Ok(snapshot) => Ok(snapshot),
+                Err(detail) if detail == UNAVAILABLE => Err(primary_detail),
+                Err(detail) => Err(detail),
+            }
+        }
+    }
+}
+
+fn auth_headers(auth: &GrokAuth, options: &UsageOptions) -> Result<HeaderMap, String> {
     let mut headers = HeaderMap::new();
+    let mut bearer = HeaderValue::from_str(&format!("Bearer {}", auth.token.0))
+        .map_err(|_| LOGIN_REQUIRED.to_owned())?;
+    bearer.set_sensitive(true);
+    headers.insert(reqwest::header::AUTHORIZATION, bearer);
+    let user_agent = format!("{}/{}", options.client.name, options.client.version);
     headers.insert(
-        reqwest::header::AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer {}", auth.token.0))
-            .map_err(|_| unreachable_billing(auth.expired))?,
+        reqwest::header::USER_AGENT,
+        HeaderValue::from_str(&user_agent).unwrap_or(HeaderValue::from_static("opsail")),
     );
+    Ok(headers)
+}
+
+async fn query_cli_billing(
+    client: &reqwest::Client,
+    endpoint: &str,
+    auth: &GrokAuth,
+    options: &UsageOptions,
+) -> Result<UsageSnapshot, String> {
+    let mut headers = auth_headers(auth, options)?;
+    headers.insert("x-xai-token-auth", HeaderValue::from_static("xai-grok-cli"));
+    headers.insert(
+        reqwest::header::ACCEPT,
+        HeaderValue::from_static("application/json"),
+    );
+    let response = client
+        .get(endpoint)
+        .headers(headers)
+        .timeout(options.timeout / 2)
+        .send()
+        .await
+        .map_err(|_| UNAVAILABLE.to_owned())?;
+    let bytes = billing_response(response).await?;
+    parse_cli_billing_payload(&bytes).ok_or_else(|| UNRECOGNIZED.to_owned())
+}
+
+async fn query_browser_billing(
+    client: &reqwest::Client,
+    endpoint: &str,
+    auth: &GrokAuth,
+    options: &UsageOptions,
+) -> Result<UsageSnapshot, String> {
+    let mut headers = auth_headers(auth, options)?;
     headers.insert(
         reqwest::header::ORIGIN,
         HeaderValue::from_static("https://grok.com"),
@@ -255,37 +290,17 @@ async fn query_billing(
         HeaderName::from_static("x-user-agent"),
         HeaderValue::from_static("connect-es/2.1.1"),
     );
-    headers.insert(
-        reqwest::header::USER_AGENT,
-        HeaderValue::from_str(&user_agent).unwrap_or(HeaderValue::from_static("opsail")),
-    );
-
     let response = client
         .post(endpoint)
         .headers(headers)
         .body(EMPTY_GRPC_WEB_FRAME.to_vec())
         .send()
         .await
-        .map_err(|_| unreachable_billing(auth.expired))?;
-    let status = response.status().as_u16();
-    if status == 401 || status == 403 {
-        return Err("Grok sign-in is no longer valid; run `grok login`".to_owned());
-    }
-    if !(200..300).contains(&status) {
-        return Err("the Grok billing endpoint is temporarily unavailable".to_owned());
-    }
-
-    let header_map = response.headers().clone();
-    if let Some(failure) = grpc_header_failure(&header_map) {
-        return Err(failure);
-    }
-    let bytes = read_bounded_response(response).await?;
-    if let Some(failure) = grpc_trailer_failure(&bytes) {
-        return Err(failure);
-    }
+        .map_err(|_| UNAVAILABLE.to_owned())?;
+    let bytes = billing_response(response).await?;
     let now_seconds = now_millis() / 1_000;
-    let parsed = parse_grok_billing_payload(&bytes, now_seconds)
-        .ok_or_else(|| "the Grok billing response was not recognized".to_owned())?;
+    let parsed =
+        parse_grok_billing_payload(&bytes, now_seconds).ok_or_else(|| UNRECOGNIZED.to_owned())?;
     let used_percent = parsed.used_percent.clamp(0.0, 100.0);
     Ok(UsageSnapshot {
         remaining_percent: (100.0 - used_percent).round().clamp(0.0, 100.0) as u8,
@@ -296,6 +311,165 @@ async fn query_billing(
         reset_credit_available_count: None,
         reset_credit_expires_at: None,
     })
+}
+
+async fn billing_response(response: reqwest::Response) -> Result<Vec<u8>, String> {
+    let status = response.status().as_u16();
+    let headers = response.headers().clone();
+    // Header-only classifications still work for oversized or broken error bodies.
+    if let Some(detail) = response_failure(status, &headers, &[])
+        && detail != UNAVAILABLE
+    {
+        return Err(detail);
+    }
+    let bytes = match read_bounded_response(response).await {
+        Ok(bytes) => bytes,
+        Err(_) if !(200..300).contains(&status) => return Err(UNAVAILABLE.to_owned()),
+        Err(detail) => return Err(detail),
+    };
+    if let Some(detail) = response_failure(status, &headers, &bytes) {
+        return Err(detail);
+    }
+    Ok(bytes)
+}
+
+fn response_failure(status: u16, headers: &HeaderMap, bytes: &[u8]) -> Option<String> {
+    if status == 401 {
+        return Some(LOGIN_REQUIRED.to_owned());
+    }
+    if status == 403 && is_html_or_cloudflare(headers, bytes) {
+        return Some(CLOUDFLARE_BLOCKED.to_owned());
+    }
+    if let Some(failure) = grpc_header_failure(headers).or_else(|| grpc_trailer_failure(bytes)) {
+        return Some(failure);
+    }
+    if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
+        let error = value.get("error").unwrap_or(&value);
+        if error.as_str().is_some_and(explicit_auth_failure)
+            || ["code", "message"].iter().any(|key| {
+                error
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .is_some_and(explicit_auth_failure)
+            })
+        {
+            return Some(LOGIN_REQUIRED.to_owned());
+        }
+    }
+    (!(200..300).contains(&status)).then(|| UNAVAILABLE.to_owned())
+}
+
+fn is_html_or_cloudflare(headers: &HeaderMap, bytes: &[u8]) -> bool {
+    let body = String::from_utf8_lossy(bytes).to_ascii_lowercase();
+    header_text(headers, "content-type")
+        .is_some_and(|v| v.to_ascii_lowercase().contains("text/html"))
+        || header_text(headers, "server").is_some_and(|v| v.eq_ignore_ascii_case("cloudflare"))
+        || headers.contains_key("cf-ray")
+        || body.contains("<html")
+        || body.contains("<!doctype html")
+        || body.contains("cf-error-details")
+        || body.contains("cf-chl-")
+        || body.contains("cloudflare")
+}
+
+fn explicit_auth_failure(message: &str) -> bool {
+    let normalized = message.trim().trim_end_matches('.').to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "unauthenticated" | "bad-credentials" | "bad credentials" | "bad_credentials"
+    ) || normalized.starts_with("bad-credentials:")
+}
+
+fn parse_cli_billing_payload(bytes: &[u8]) -> Option<UsageSnapshot> {
+    let root: Value = serde_json::from_slice(bytes).ok()?;
+    let config = root.get("config")?.as_object()?;
+    let current = config.get("currentPeriod").filter(|v| !v.is_null());
+    let (start, end) = if let Some(period) = current {
+        let period = period.as_object()?;
+        (period.get("start"), period.get("end"))
+    } else {
+        (
+            config.get("billingPeriodStart"),
+            config.get("billingPeriodEnd"),
+        )
+    };
+    let start = start.and_then(Value::as_str).and_then(parse_rfc3339_millis);
+    let end = end.and_then(Value::as_str).and_then(parse_rfc3339_millis);
+    let duration = start
+        .zip(end)
+        .and_then(|(start, end)| end.checked_sub(start))
+        .filter(|duration| *duration > 0)
+        .map(|duration| duration as f64 / 60_000.0);
+    let used_percent = match config.get("creditUsagePercent") {
+        Some(value) => value.as_f64()?,
+        None if config.contains_key("monthlyLimit") => {
+            let limit = cent_value(config.get("monthlyLimit")?)?;
+            if limit <= 0.0 {
+                return None;
+            }
+            let used = config.get("used").map(cent_value).unwrap_or(Some(0.0))?;
+            used / limit * 100.0
+        }
+        // Proto3 omits a zero scalar. Require a complete, recognized credits period
+        // before accepting this shape (the official CLI also treats it as zero).
+        None if !config.contains_key("used")
+            && duration.is_some()
+            && current
+                .and_then(|p| p.get("type"))
+                .and_then(Value::as_str)
+                .is_some_and(|kind| {
+                    matches!(
+                        kind,
+                        "USAGE_PERIOD_TYPE_WEEKLY" | "USAGE_PERIOD_TYPE_MONTHLY"
+                    )
+                }) =>
+        {
+            0.0
+        }
+        None => return None,
+    };
+    if !used_percent.is_finite() {
+        return None;
+    }
+    let used_percent = used_percent.clamp(0.0, 100.0);
+    // Only known plan names are projected; arbitrary server strings may contain PII.
+    let plan_type = root
+        .get("subscription_tier")
+        .and_then(Value::as_str)
+        .filter(|name| {
+            matches!(
+                *name,
+                "SuperGrok"
+                    | "SuperGrok Heavy"
+                    | "SuperGrok Lite"
+                    | "SuperGrok Plus"
+                    | "Premium"
+                    | "Premium+"
+                    | "Free"
+            )
+        })
+        .map(ToOwned::to_owned);
+    Some(UsageSnapshot {
+        remaining_percent: (100.0 - used_percent).round() as u8,
+        used_percent,
+        resets_at: end.map(|millis| millis / 1_000),
+        window_duration_mins: duration,
+        plan_type,
+        reset_credit_available_count: None,
+        reset_credit_expires_at: None,
+    })
+}
+
+fn cent_value(value: &Value) -> Option<f64> {
+    let object = value.as_object()?;
+    let amount = match object.get("val") {
+        // A present, empty Cent is proto3's zero.
+        None if object.is_empty() => 0.0,
+        None => return None,
+        Some(Value::String(value)) => value.parse::<f64>().ok()?,
+        Some(value) => value.as_f64()?,
+    };
+    (amount.is_finite() && amount >= 0.0).then_some(amount)
 }
 
 async fn read_bounded_response(response: reqwest::Response) -> Result<Vec<u8>, String> {
@@ -317,14 +491,6 @@ async fn read_bounded_response(response: reqwest::Response) -> Result<Vec<u8>, S
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
-}
-
-fn unreachable_billing(expired: bool) -> String {
-    if expired {
-        "Grok sign-in may have expired; run `grok login`".to_owned()
-    } else {
-        "could not reach the Grok billing endpoint".to_owned()
-    }
 }
 
 fn grpc_header_failure(headers: &HeaderMap) -> Option<String> {
@@ -373,13 +539,8 @@ fn grpc_trailer_failure(bytes: &[u8]) -> Option<String> {
 
 fn grpc_failure(status: i32, message: &str) -> String {
     let normalized = message.to_ascii_lowercase();
-    if status == 16
-        || (status == 7
-            && (normalized.contains("bad-credentials")
-                || normalized.contains("unauthenticated")
-                || normalized.contains("access token")))
-    {
-        return "Grok sign-in is no longer valid; run `grok login`".to_owned();
+    if status == 16 || explicit_auth_failure(message) {
+        return LOGIN_REQUIRED.to_owned();
     }
     if status == 9 && normalized.trim_end_matches('.').trim() == "no personal team" {
         return "Grok team accounts do not expose personal remaining-usage windows".to_owned();
@@ -657,9 +818,419 @@ fn from_hex(byte: u8) -> Option<u8> {
 mod tests {
     use serde_json::json;
 
-    use super::{
-        GrokToken, grpc_web_frames, parse_grok_auth, parse_grok_billing_payload, percent_decode,
-    };
+    use super::*;
+
+    const CLI_FIXTURE: &[u8] = include_bytes!("../tests/fixtures/grok-credits.json");
+
+    fn parse_cli(value: Value) -> Option<UsageSnapshot> {
+        parse_cli_billing_payload(&serde_json::to_vec(&value).unwrap())
+    }
+
+    fn mock_options(server: &wiremock::MockServer) -> (tempfile::TempDir, UsageOptions) {
+        let directory = tempfile::tempdir().unwrap();
+        let auth_path = directory.path().join("auth.json");
+        std::fs::write(
+            &auth_path,
+            json!({"https://auth.x.ai::fixture": {
+                "key": "private-token", "refresh_token": "private-refresh",
+                "expires_at": "2099-01-01T00:00:00Z", "auth_mode": "oidc"
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        (
+            directory,
+            UsageOptions {
+                providers: vec![UsageProvider::Grok],
+                grok_auth_path: Some(auth_path),
+                grok_endpoint: Some(format!("{}/v1/billing?format=credits", server.uri())),
+                grok_fallback_endpoint: Some(format!("{}/legacy", server.uri())),
+                ..UsageOptions::default()
+            },
+        )
+    }
+
+    #[test]
+    fn cli_real_shape_recognizes_omitted_proto3_zero_without_including_paid_credits() {
+        let snapshot = parse_cli_billing_payload(CLI_FIXTURE).unwrap();
+        assert_eq!(snapshot.used_percent, 0.0);
+        assert_eq!(snapshot.remaining_percent, 100);
+        assert_eq!(snapshot.resets_at, Some(1_788_825_600));
+        assert_eq!(snapshot.window_duration_mins, Some(10080.0));
+        assert_eq!(snapshot.plan_type, None);
+    }
+
+    #[test]
+    fn cli_percent_is_authoritative_and_clamped_and_only_known_plans_are_projected() {
+        let mut fixture: Value = serde_json::from_slice(CLI_FIXTURE).unwrap();
+        fixture["config"]["monthlyLimit"] = json!({"val": 100});
+        fixture["config"]["used"] = json!({"val": 99});
+        fixture["subscription_tier"] = json!("SuperGrok Heavy");
+        for (value, expected, remaining) in [(37.5, 37.5, 63), (-1.0, 0.0, 100), (120.0, 100.0, 0)]
+        {
+            fixture["config"]["creditUsagePercent"] = json!(value);
+            let snapshot = parse_cli(fixture.clone()).unwrap();
+            assert_eq!(snapshot.used_percent, expected);
+            assert_eq!(snapshot.remaining_percent, remaining);
+            assert_eq!(snapshot.plan_type.as_deref(), Some("SuperGrok Heavy"));
+        }
+        fixture["subscription_tier"] = json!("private@example.invalid");
+        assert!(parse_cli(fixture).unwrap().plan_type.is_none());
+    }
+
+    #[test]
+    fn cli_legacy_cents_support_numbers_strings_and_proto3_zero() {
+        let mut fixture = json!({"config": {
+            "monthlyLimit": {"val": "2000"}, "used": {"val": 500},
+            "billingPeriodStart": "2026-09-01T00:00:00Z",
+            "billingPeriodEnd": "2026-10-01T00:00:00Z",
+            "onDemandUsed": {"val": 9000}
+        }});
+        let snapshot = parse_cli(fixture.clone()).unwrap();
+        assert_eq!(snapshot.used_percent, 25.0);
+        assert_eq!(snapshot.window_duration_mins, Some(43200.0));
+        for used in [json!({}), json!({"val": "0"})] {
+            fixture["config"]["used"] = used;
+            assert_eq!(parse_cli(fixture.clone()).unwrap().used_percent, 0.0);
+        }
+        fixture["config"].as_object_mut().unwrap().remove("used");
+        assert_eq!(parse_cli(fixture.clone()).unwrap().used_percent, 0.0);
+        for limit in [
+            json!({}),
+            json!({"val": 0}),
+            json!({"val": -1}),
+            json!({"val": "NaN"}),
+        ] {
+            fixture["config"]["monthlyLimit"] = limit;
+            assert!(parse_cli(fixture.clone()).is_none());
+        }
+    }
+
+    #[test]
+    fn cli_does_not_turn_unknown_or_malformed_responses_into_full_allowance() {
+        for value in [
+            json!({}),
+            json!({"config": null}),
+            json!({"config": {}}),
+            json!({"config": {"creditUsagePercent": null}}),
+            json!({"config": {"creditUsagePercent": "25"}}),
+            json!({"config": {"used": {"val": 100}}}),
+            json!({"config": {"monthlyLimit": {"val": 100}, "used": {"other": 1}}}),
+        ] {
+            assert!(parse_cli(value).is_none());
+        }
+        for (field, invalid) in [
+            ("type", "unknown"),
+            ("start", "2026-02-30T00:00:00Z"),
+            ("end", "2026-08-01T00:00:00Z"),
+            ("end", "not-a-date"),
+        ] {
+            let mut fixture: Value = serde_json::from_slice(CLI_FIXTURE).unwrap();
+            fixture["config"]["currentPeriod"][field] = json!(invalid);
+            assert!(parse_cli(fixture).is_none());
+        }
+        assert!(parse_cli_billing_payload(b"<html>private-response</html>").is_none());
+    }
+
+    #[test]
+    fn cli_period_uses_offsets_and_never_mixes_current_and_deprecated_dates() {
+        let mut fixture = json!({"config": {
+            "creditUsagePercent": 25,
+            "currentPeriod": {"start": "2026-09-01T08:00:00.123456+08:00",
+                "end": "2026-09-08T08:00:00.123456+08:00"},
+            "billingPeriodStart": "2026-08-01T00:00:00Z",
+            "billingPeriodEnd": "2026-10-01T00:00:00Z"
+        }});
+        let snapshot = parse_cli(fixture.clone()).unwrap();
+        assert_eq!(snapshot.resets_at, Some(1_788_825_600));
+        assert_eq!(snapshot.window_duration_mins, Some(10080.0));
+        fixture["config"]["currentPeriod"]
+            .as_object_mut()
+            .unwrap()
+            .remove("start");
+        assert_eq!(parse_cli(fixture).unwrap().window_duration_mins, None);
+    }
+
+    #[test]
+    fn expiry_respects_timezone_and_exact_deadline() {
+        for expires in ["2026-09-01T08:00:00+08:00", "2026-09-01T00:00:00Z"] {
+            let text =
+                json!({"https://auth.x.ai::fixture": {"key": "fixture", "expires_at": expires}})
+                    .to_string();
+            assert!(parse_grok_auth(&text, 1_788_220_800_000).unwrap().expired);
+            assert!(!parse_grok_auth(&text, 1_788_220_799_999).unwrap().expired);
+        }
+    }
+
+    #[test]
+    fn bearer_headers_are_sensitive() {
+        let auth = GrokAuth {
+            token: GrokToken("private-token".into()),
+            expired: false,
+        };
+        let headers = auth_headers(&auth, &UsageOptions::default()).unwrap();
+        assert!(headers[reqwest::header::AUTHORIZATION].is_sensitive());
+        assert!(!format!("{headers:?}").contains("private-token"));
+    }
+
+    #[test]
+    fn http_authentication_is_distinct_from_cloudflare_and_other_denials() {
+        let empty = HeaderMap::new();
+        for (status, body, expected) in [
+            (401, "", LOGIN_REQUIRED),
+            (
+                403,
+                "<!DOCTYPE html><html><div id='cf-error-details'>Attention Required</div>",
+                CLOUDFLARE_BLOCKED,
+            ),
+            (403, "<html>Forbidden</html>", CLOUDFLARE_BLOCKED),
+            (403, "cf-chl-challenge", CLOUDFLARE_BLOCKED),
+            (403, r#"{"error":"bad-credentials"}"#, LOGIN_REQUIRED),
+            (
+                403,
+                r#"{"error":{"code":"unauthenticated"}}"#,
+                LOGIN_REQUIRED,
+            ),
+            (
+                403,
+                r#"{"error":"permission denied for this access token"}"#,
+                UNAVAILABLE,
+            ),
+            (403, r#"{"error":"billing disabled"}"#, UNAVAILABLE),
+            (429, "private-body", UNAVAILABLE),
+            (500, "private-body", UNAVAILABLE),
+            (302, "", UNAVAILABLE),
+            (503, "<html>Cloudflare</html>", UNAVAILABLE),
+        ] {
+            assert_eq!(
+                response_failure(status, &empty, body.as_bytes()).as_deref(),
+                Some(expected)
+            );
+        }
+        for (key, value) in [
+            ("server", "cloudflare"),
+            ("cf-ray", "redacted"),
+            ("content-type", "text/html; charset=UTF-8"),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                HeaderName::from_bytes(key.as_bytes()).unwrap(),
+                HeaderValue::from_static(value),
+            );
+            assert_eq!(
+                response_failure(403, &headers, b"").as_deref(),
+                Some(CLOUDFLARE_BLOCKED)
+            );
+        }
+        assert_eq!(response_failure(200, &empty, CLI_FIXTURE), None);
+    }
+
+    #[test]
+    fn grpc_authentication_checks_headers_and_trailers_without_broad_token_matches() {
+        for (status, message, expected) in [
+            (16, "anything", LOGIN_REQUIRED),
+            (7, "bad-credentials", LOGIN_REQUIRED),
+            (7, "unauthenticated", LOGIN_REQUIRED),
+            (7, "access token lacks this permission", UNAVAILABLE),
+            (7, "permission denied", UNAVAILABLE),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("grpc-status", status.to_string().parse().unwrap());
+            headers.insert("grpc-message", message.parse().unwrap());
+            assert_eq!(
+                response_failure(200, &headers, &[]).as_deref(),
+                Some(expected)
+            );
+            let trailer = grpc_frame(
+                0x80,
+                format!("grpc-status: {status}\r\ngrpc-message: {message}\r\n").as_bytes(),
+            );
+            assert_eq!(
+                response_failure(200, &HeaderMap::new(), &trailer).as_deref(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cli_get_precedes_legacy_and_keeps_auth_and_paid_balances_out_of_reports() {
+        use wiremock::matchers::{header, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let (_dir, options) = mock_options(&server);
+        let before = std::fs::read(options.grok_auth_path.as_ref().unwrap()).unwrap();
+        Mock::given(method("GET"))
+            .and(path("/v1/billing"))
+            .and(query_param("format", "credits"))
+            .and(header("authorization", "Bearer private-token"))
+            .and(header("x-xai-token-auth", "xai-grok-cli"))
+            .and(header("accept", "application/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(CLI_FIXTURE))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let report = crate::read_usage(&options).await;
+        assert_eq!(report.providers[0].status, crate::UsageStatus::Ready);
+        assert_eq!(report.providers[0].remaining_percent, Some(100));
+        let encoded = serde_json::to_string(&report).unwrap();
+        for forbidden in [
+            "private-token",
+            "private-refresh",
+            "prepaid",
+            "onDemand",
+            "topUp",
+            "windows",
+        ] {
+            assert!(!encoded.contains(forbidden));
+        }
+        assert_eq!(
+            before,
+            std::fs::read(options.grok_auth_path.as_ref().unwrap()).unwrap()
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].body.is_empty());
+        assert!(!requests[0].headers.contains_key("x-userid"));
+        assert!(!requests[0].headers.contains_key("x-grok-client-version"));
+    }
+
+    #[tokio::test]
+    async fn rejected_auth_does_not_fall_back_or_modify_credentials() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let (_dir, options) = mock_options(&server);
+        let before = std::fs::read(options.grok_auth_path.as_ref().unwrap()).unwrap();
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("private-response"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert_eq!(
+            read_grok_usage(&options).await.detail.as_deref(),
+            Some(LOGIN_REQUIRED)
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(
+            before,
+            std::fs::read(options.grok_auth_path.as_ref().unwrap()).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_auth_does_not_make_any_request_or_refresh() {
+        let server = wiremock::MockServer::start().await;
+        let (_dir, options) = mock_options(&server);
+        let path = options.grok_auth_path.as_ref().unwrap();
+        let mut auth: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        auth["https://auth.x.ai::fixture"]["expires_at"] = json!("2000-01-01T00:00:00Z");
+        let before = serde_json::to_vec(&auth).unwrap();
+        std::fs::write(path, &before).unwrap();
+        assert_eq!(
+            read_grok_usage(&options).await.detail.as_deref(),
+            Some(LOGIN_REQUIRED)
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert_eq!(before, std::fs::read(path).unwrap());
+    }
+
+    #[tokio::test]
+    async fn browser_fallback_cloudflare_does_not_request_login() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let (_dir, options) = mock_options(&server);
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/legacy"))
+            .respond_with(ResponseTemplate::new(403).set_body_string(
+                "<html><div id='cf-error-details'>Attention Required</div></html>",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert_eq!(
+            read_grok_usage(&options).await.detail.as_deref(),
+            Some(CLOUDFLARE_BLOCKED)
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn cli_timeout_or_unrecognized_json_can_still_use_legacy_within_the_deadline() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for delayed in [false, true] {
+            let server = MockServer::start().await;
+            let (_dir, mut options) = mock_options(&server);
+            options.timeout = std::time::Duration::from_millis(300);
+            let response = ResponseTemplate::new(200).set_body_string("{}");
+            let response = if delayed {
+                response.set_delay(std::time::Duration::from_secs(2))
+            } else {
+                response
+            };
+            Mock::given(method("GET"))
+                .respond_with(response)
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/legacy"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(grpc_frame(0, &field_message(1, &field_float(1, 12.25)))),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let report = crate::read_usage(&options).await;
+            assert_eq!(report.providers[0].used_percent, Some(12.25));
+            assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn cli_redirects_are_not_followed_and_responses_are_bounded() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for oversized in [false, true] {
+            let server = MockServer::start().await;
+            let (_dir, options) = mock_options(&server);
+            let response = if oversized {
+                ResponseTemplate::new(200).set_body_bytes(vec![0; MAX_GROK_RESPONSE_BYTES + 1])
+            } else {
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/leak", server.uri()))
+            };
+            Mock::given(method("GET"))
+                .and(path("/v1/billing"))
+                .respond_with(response)
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/legacy"))
+                .respond_with(ResponseTemplate::new(503))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let entry = read_grok_usage(&options).await;
+            assert_eq!(entry.status, crate::UsageStatus::Unavailable);
+            if oversized {
+                assert!(entry.detail.unwrap().contains("2 MiB"));
+            } else {
+                assert_eq!(entry.detail.as_deref(), Some(UNAVAILABLE));
+            }
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(requests.iter().all(|r| r.url.path() != "/leak"));
+        }
+    }
 
     fn varint(mut remaining: u64) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -847,7 +1418,8 @@ mod tests {
         let report = read_usage(&UsageOptions {
             providers: vec![UsageProvider::Grok],
             grok_auth_path: Some(auth_path),
-            grok_endpoint: Some(format!(
+            grok_endpoint: Some(format!("{}/v1/billing?format=credits", server.uri())),
+            grok_fallback_endpoint: Some(format!(
                 "{}/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig",
                 server.uri()
             )),
@@ -900,7 +1472,8 @@ mod tests {
         let report = read_usage(&UsageOptions {
             providers: vec![UsageProvider::Grok],
             grok_auth_path: Some(auth_path),
-            grok_endpoint: Some(format!(
+            grok_endpoint: Some(format!("{}/v1/billing?format=credits", server.uri())),
+            grok_fallback_endpoint: Some(format!(
                 "{}/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig",
                 server.uri()
             )),

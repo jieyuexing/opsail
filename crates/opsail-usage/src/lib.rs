@@ -2,7 +2,7 @@
 //!
 //! Codex is read through a short-lived official `codex app-server --stdio`
 //! process. Grok is read through the CLI sign-in file and the official
-//! grok.com billing endpoint. Neither path attaches to ChatGPT.app, injects
+//! CLI proxy billing endpoint, with a grok.com fallback. Neither path attaches to ChatGPT.app, injects
 //! renderer UI, or retains tokens, RPC bodies, or auth files in snapshots.
 
 mod claude;
