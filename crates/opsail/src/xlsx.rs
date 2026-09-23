@@ -128,16 +128,16 @@ pub(crate) async fn run(args: XlsxArgs) -> ExitCode {
     let result = match request(args).await {
         Ok(request) => {
             match tokio::task::spawn_blocking(move || opsail_xlsx::execute(request)).await {
-                Ok(result) => result.map_err(|e| e.to_string()),
-                Err(error) => Err(error.to_string()),
+                Ok(result) => result.map_err(|e| e.details()),
+                Err(error) => Err(json!({"message":error.to_string()})),
             }
         }
-        Err(error) => Err(error),
+        Err(error) => Err(json!({"message":error})),
     };
     let (response, exit) = match result {
         Ok(response) => (response, ExitCode::SUCCESS),
-        Err(message) => (
-            json!({ "schemaVersion": 1, "error": { "message": message } }),
+        Err(error) => (
+            json!({ "schemaVersion": 1, "error": error }),
             ExitCode::from(2),
         ),
     };

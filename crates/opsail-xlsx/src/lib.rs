@@ -1,7 +1,10 @@
 //! Bounded, loss-conscious XLSX inspection and candidate editing.
 //! This module models stored OOXML, not Excel's rendering/calculation engine.
 mod package;
+mod references;
 mod styles;
+#[cfg(test)]
+mod tests;
 mod workbook;
 mod xml;
 use serde::Deserialize;
@@ -11,6 +14,14 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum Error {
+    #[error("operation {index} ({op} {sheet}!{target}): {message}")]
+    Operation {
+        index: usize,
+        op: String,
+        sheet: String,
+        target: String,
+        message: String,
+    },
     #[error("invalid request: {0}")]
     Request(String),
     #[error("invalid or unsupported XLSX: {0}")]
@@ -21,6 +32,26 @@ pub enum Error {
     Zip(#[from] zip::result::ZipError),
     #[error("JSON: {0}")]
     Json(#[from] serde_json::Error),
+}
+impl Error {
+    /// Machine-readable details, retaining the complete human-readable message.
+    pub fn details(&self) -> Value {
+        let mut value = json!({"message": self.to_string()});
+        if let Self::Operation {
+            index,
+            op,
+            sheet,
+            target,
+            ..
+        } = self
+        {
+            value["operationIndex"] = json!(index);
+            value["op"] = json!(op);
+            value["sheet"] = json!(sheet);
+            value["target"] = json!(target);
+        }
+        value
+    }
 }
 type Result<T> = std::result::Result<T, Error>;
 fn invalid(message: impl Into<String>) -> Error {
@@ -40,11 +71,23 @@ struct Request {
     max_bytes: Option<u64>,
     max_expanded_bytes: Option<u64>,
     output: Option<String>,
+    #[serde(default)]
+    validate_only: bool,
+    #[serde(default)]
+    detail: Detail,
+    include_parts: Option<bool>,
     expected_sha256: Option<String>,
     #[serde(default)]
     operations: Vec<Operation>,
     before: Option<String>,
     after: Option<String>,
+}
+#[derive(Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+enum Detail {
+    #[default]
+    Full,
+    Compact,
 }
 fn default_cells() -> usize {
     200
@@ -57,6 +100,34 @@ fn default_cells() -> usize {
     deny_unknown_fields
 )]
 enum Operation {
+    InsertRows {
+        sheet: String,
+        before: u32,
+        count: u32,
+        #[serde(default)]
+        style_from: RowStyle,
+    },
+    SetFormula {
+        sheet: String,
+        cell: String,
+        expected_text: String,
+        formula: String,
+    },
+    SetNumber {
+        sheet: String,
+        cell: String,
+        expected_text: String,
+        value: f64,
+    },
+    AppendText {
+        sheet: String,
+        cell: String,
+        expected_text: String,
+        value: String,
+        font_color: Option<String>,
+        bold: Option<bool>,
+        strike: Option<bool>,
+    },
     SetText {
         sheet: String,
         cell: String,
@@ -90,15 +161,50 @@ enum Operation {
         hidden: bool,
     },
 }
+#[derive(Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+enum RowStyle {
+    #[default]
+    Above,
+    None,
+}
 impl Operation {
     fn sheet(&self) -> &str {
         match self {
-            Self::SetText { sheet, .. }
+            Self::InsertRows { sheet, .. }
+            | Self::SetText { sheet, .. }
+            | Self::SetFormula { sheet, .. }
+            | Self::SetNumber { sheet, .. }
+            | Self::AppendText { sheet, .. }
             | Self::SetStyle { sheet, .. }
             | Self::CopyStyle { sheet, .. }
             | Self::RowHeight { sheet, .. }
             | Self::ColumnWidth { sheet, .. }
             | Self::RowVisibility { sheet, .. } => sheet,
+        }
+    }
+    fn location(&self) -> (&str, String) {
+        match self {
+            Self::InsertRows { before, .. } => ("insertRows", before.to_string()),
+            Self::SetText { cell, .. } => ("setText", cell.clone()),
+            Self::SetFormula { cell, .. } => ("setFormula", cell.clone()),
+            Self::SetNumber { cell, .. } => ("setNumber", cell.clone()),
+            Self::AppendText { cell, .. } => ("appendText", cell.clone()),
+            Self::SetStyle { range, .. } => ("setStyle", range.clone()),
+            Self::CopyStyle { range, .. } => ("copyStyle", range.clone()),
+            Self::RowHeight { row, .. } => ("rowHeight", row.to_string()),
+            Self::RowVisibility { row, .. } => ("rowVisibility", row.to_string()),
+            Self::ColumnWidth { column, .. } => ("columnWidth", column.clone()),
+        }
+    }
+    fn error(&self, index: usize, error: Error) -> Error {
+        let (op, target) = self.location();
+        Error::Operation {
+            index,
+            op: op.into(),
+            sheet: self.sheet().into(),
+            target,
+            message: error.to_string(),
         }
     }
 }
@@ -131,8 +237,14 @@ pub fn execute(value: Value) -> Result<Value> {
     }
     let common = ["schemaVersion", "operation", "maxBytes", "maxExpandedBytes"];
     let extra: &[&str] = match req.operation.as_str() {
-        "inspect" => &["source", "ranges", "maxCells"],
-        "patch" => &["source", "output", "expectedSha256", "operations"],
+        "inspect" => &["source", "ranges", "maxCells", "detail", "includeParts"],
+        "patch" => &[
+            "source",
+            "output",
+            "expectedSha256",
+            "operations",
+            "validateOnly",
+        ],
         "diff" => &["before", "after", "maxCells"],
         _ => {
             return Err(Error::Request(
@@ -161,9 +273,12 @@ pub fn execute(value: Value) -> Result<Value> {
             }
             let pkg = package::Package::read(absolute(&req.source)?, limits)?;
             let book = workbook::Book::load(&pkg)?;
-            let mut report = book.inspect(&req.ranges, req.max_cells)?;
+            let mut report =
+                book.inspect(&req.ranges, req.max_cells, req.detail == Detail::Compact)?;
             report["sourceSha256"] = json!(pkg.sha());
-            report["parts"] = json!(pkg.inventory());
+            if req.include_parts.unwrap_or(req.detail == Detail::Full) {
+                report["parts"] = json!(pkg.inventory());
+            }
             envelope("inspect", report)
         }
         "diff" => {
@@ -202,12 +317,14 @@ pub fn execute(value: Value) -> Result<Value> {
                 return Err(Error::Request("operations must contain 1-256 edits".into()));
             }
             let source = absolute(&req.source)?;
-            let output = absolute(
-                req.output
-                    .as_deref()
-                    .ok_or_else(|| Error::Request("output is required".into()))?,
-            )?;
-            if output.symlink_metadata().is_ok() {
+            let output = if req.validate_only {
+                None
+            } else {
+                Some(absolute(req.output.as_deref().ok_or_else(|| {
+                    Error::Request("output is required".into())
+                })?)?)
+            };
+            if output.is_some_and(|path| path.symlink_metadata().is_ok()) {
                 return Err(Error::Request(
                     "output already exists; use a new candidate path".into(),
                 ));
@@ -227,22 +344,49 @@ pub fn execute(value: Value) -> Result<Value> {
             }
             let mut book = workbook::Book::load(&pkg)?;
             let mut count = 0;
-            for op in &req.operations {
-                count += book.apply(op)?;
-                if count > 10000 {
-                    return Err(Error::Request(
-                        "patch target budget exceeds 10000 cells/rows/columns".into(),
-                    ));
+            let mut violations = Vec::new();
+            let mut rows_inserted = Vec::new();
+            for (index, op) in req.operations.iter().enumerate() {
+                match book.apply_bounded(op, 10000 - count, req.validate_only) {
+                    Ok(processed) => {
+                        count += processed;
+                        if let Operation::InsertRows {
+                            sheet,
+                            before,
+                            count,
+                            ..
+                        } = op
+                        {
+                            rows_inserted
+                                .push(json!({"sheet":sheet,"before":before,"count":count}));
+                        }
+                    }
+                    Err(error) => {
+                        let error = op.error(index, error);
+                        if !req.validate_only {
+                            return Err(error);
+                        }
+                        violations.push(error.details());
+                    }
                 }
             }
             let updates = book.updates(&pkg)?;
             let changed: Vec<_> = updates.keys().cloned().collect();
+            if req.validate_only {
+                return envelope(
+                    "patch",
+                    json!({"validateOnly":true,"sourceSha256":hash,
+                    "violations":violations,"operationsChecked":req.operations.len(),
+                    "targetsProcessed":count,"wouldChangeParts":changed,"rowsInserted":rows_inserted}),
+                );
+            }
+            let output = output.unwrap();
             // Validate even unusually large part-name metadata before writing
             // a candidate. After publication, substituting the fixed-width SHA
             // cannot turn a successful patch into an output-budget failure.
             let mut report = envelope(
                 "patch",
-                json!({"sourceSha256":hash,"candidateSha256":"0".repeat(64),"output":output,"changedParts":changed,"operationsApplied":req.operations.len(),"targetsProcessed":count,"sourceUnchangedAtPublish":true}),
+                json!({"sourceSha256":hash,"candidateSha256":"0".repeat(64),"output":output,"changedParts":changed,"operationsApplied":req.operations.len(),"targetsProcessed":count,"rowsInserted":rows_inserted,"sourceUnchangedAtPublish":true}),
             )?;
             let candidate = pkg.publish(source, output, &updates, limits)?;
             report["candidateSha256"] = json!(candidate);
@@ -254,6 +398,16 @@ pub fn execute(value: Value) -> Result<Value> {
 fn envelope(operation: &str, mut v: Value) -> Result<Value> {
     v["schemaVersion"] = json!(1);
     v["operation"] = json!(operation);
+    v["protocolFeatures"] = json!([
+        "createCells",
+        "setNumber",
+        "appendText",
+        "copyStyleAdoptBase",
+        "validateOnly",
+        "compactInspect",
+        "setFormula",
+        "insertRows"
+    ]);
     v["visualVerification"] = json!("pending");
     v["proofBoundary"] = json!(
         "Stored OOXML only; conditional formatting, native objects, layout, printing, formula recalculation and business acceptance require separate verification."

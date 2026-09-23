@@ -79,11 +79,15 @@ pub fn resolved(doc: &Document, id: usize) -> Result<Value> {
 }
 /// Valid only for one mutable style document. v1 appends records and never
 /// changes existing ones, so the first matching index remains stable.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct AppendCache {
     collections: BTreeMap<String, BTreeMap<String, usize>>,
+    revision: usize,
 }
 impl AppendCache {
+    pub fn revision(&self) -> usize {
+        self.revision
+    }
     fn append(&mut self, root: &mut Element, name: &str, e: Element) -> Result<usize> {
         let list = root
             .child_mut(name)
@@ -106,6 +110,7 @@ impl AppendCache {
         list.children.push(Node::Element(e));
         list.attrs.insert("count".into(), (i + 1).to_string());
         signatures.insert(signature, i);
+        self.revision += 1;
         Ok(i)
     }
 }
@@ -268,6 +273,22 @@ pub fn copy(
     let root = doc.root_mut().map_err(invalid)?;
     let mut to = record(root, "cellXfs", target)?;
     let from = record(root, "cellXfs", donor)?;
+    if selected
+        .iter()
+        .any(|s| !["font", "fill", "border", "alignment", "numberFormat"].contains(&s.as_str()))
+    {
+        return Err(invalid("unsupported copyStyle component"));
+    }
+    if selected.len() == 5 {
+        // All five components explicitly adopt the donor cell style entirely,
+        // including its base, flags, protection and extension records.
+        return cache.append(root, "cellXfs", from);
+    }
+    if index(&from, "xfId")? != index(&to, "xfId")? {
+        return Err(invalid(
+            "copyStyle across different inherited base styles requires all five components to adopt the donor cell style entirely",
+        ));
+    }
     for name in selected {
         let (attribute, flag) = match name.as_str() {
             "font" => ("fontId", "applyFont"),
@@ -294,15 +315,174 @@ pub fn copy(
         } else {
             to.attrs.remove(flag);
         }
-        // Differing base styles with disabled application are ambiguous. Refuse
-        // instead of claiming a component was copied while inheritance wins.
-        if index(&from, "xfId")? != index(&to, "xfId")?
-            && from.attrs.get(flag).is_none_or(|v| v != "1")
-        {
-            return Err(invalid(
-                "copyStyle across different inherited base styles requires native application",
-            ));
-        }
     }
     cache.append(root, "cellXfs", to)
+}
+
+/// Copy the stored font into a run, using CT_RPrElt names and order.
+pub fn run_properties(
+    doc: &Document,
+    id: usize,
+    parent: &Element,
+    overrides: &Style,
+) -> Result<Element> {
+    let root = doc.root().map_err(invalid)?;
+    let xf = record(root, "cellXfs", id)?;
+    if xf
+        .attrs
+        .get("applyFont")
+        .is_some_and(|v| v == "0" || v == "false")
+    {
+        return Err(invalid(
+            "applyFont=false requires native application to preserve inherited formatting",
+        ));
+    }
+    let font = record(root, "fonts", index(&xf, "fontId")?)?;
+    let mut properties = make(parent, "rPr");
+    // CT_RPrElt (font name precedes charset/family, then booleans and size).
+    for name in [
+        "name",
+        "charset",
+        "family",
+        "b",
+        "i",
+        "strike",
+        "outline",
+        "shadow",
+        "condense",
+        "extend",
+        "color",
+        "sz",
+        "u",
+        "vertAlign",
+        "scheme",
+    ] {
+        let mut child = font.child(name).cloned();
+        if name == "color" {
+            if let Some(color) = &overrides.font_color {
+                let mut e = make(parent, "color");
+                e.attrs.insert("rgb".into(), rgb(color)?);
+                child = Some(e);
+            }
+        } else if let Some(value) = match name {
+            "b" => overrides.bold,
+            "strike" => overrides.strike,
+            _ => None,
+        } {
+            let mut e = make(parent, name);
+            e.attrs
+                .insert("val".into(), if value { "1" } else { "0" }.into());
+            child = Some(e);
+        }
+        if let Some(mut child) = child {
+            child.name = make(parent, if name == "name" { "rFont" } else { name }).name;
+            properties.children.push(Node::Element(child));
+        }
+    }
+    if font.elements().any(|e| {
+        ![
+            "name",
+            "charset",
+            "family",
+            "b",
+            "i",
+            "strike",
+            "outline",
+            "shadow",
+            "condense",
+            "extend",
+            "color",
+            "sz",
+            "u",
+            "vertAlign",
+            "scheme",
+        ]
+        .contains(&e.local_name())
+    }) {
+        return Err(invalid(
+            "unsupported font properties require native application",
+        ));
+    }
+    Ok(properties)
+}
+fn boolean(e: Option<&Element>, attr: &str, default: bool) -> bool {
+    e.map_or(default, |e| {
+        e.attrs.get(attr).is_none_or(|v| v != "0" && v != "false")
+    })
+}
+fn number(e: Option<&Element>, attr: &str) -> Option<f64> {
+    e.and_then(|e| e.attrs.get(attr))
+        .and_then(|v| v.parse().ok())
+}
+fn color(e: Option<&Element>) -> Value {
+    let Some(e) = e else {
+        return Value::Null;
+    };
+    if let Some(rgb) = e.attrs.get("rgb") {
+        return json!({"rgb":rgb});
+    }
+    if let Some(theme) = e.attrs.get("theme").and_then(|v| v.parse::<u32>().ok()) {
+        let mut color = json!({"theme":theme});
+        if let Some(tint) = number(Some(e), "tint").filter(|v| *v != 0.0) {
+            color["tint"] = json!(tint);
+        }
+        return color;
+    }
+    if let Some(indexed) = e.attrs.get("indexed").and_then(|v| v.parse::<u32>().ok()) {
+        return json!({"indexed":indexed});
+    }
+    Value::Null
+}
+pub fn compact(doc: &Document, id: usize) -> Result<Value> {
+    let root = doc.root().map_err(invalid)?;
+    let xf = record(root, "cellXfs", id)?;
+    let font = record(root, "fonts", index(&xf, "fontId")?)?;
+    let fill = record(root, "fills", index(&xf, "fillId")?)?;
+    let border = record(root, "borders", index(&xf, "borderId")?)?;
+    let alignment = xf.child("alignment");
+    let mut sides = serde_json::Map::new();
+    for side in ["left", "right", "top", "bottom"] {
+        sides.insert(
+            side.into(),
+            json!(
+                border
+                    .child(side)
+                    .and_then(|e| e.attrs.get("style"))
+                    .filter(|s| s.as_str() != "none")
+            ),
+        );
+    }
+    let mut value = json!({"styleId":id,"baseStyleId":index(&xf,"xfId")?,"style":{
+        "font":{"name":font.child("name").and_then(|e|e.attrs.get("val")),"size":number(font.child("sz"),"val"),
+            "color":color(font.child("color")),"bold":boolean(font.child("b"),"val",false),
+            "italic":boolean(font.child("i"),"val",false),"strike":boolean(font.child("strike"),"val",false)},
+        "fill":{"color":color(fill.child("patternFill").and_then(|p|p.child("fgColor")))},
+        "border":sides,"alignment":{"horizontal":alignment.and_then(|e|e.attrs.get("horizontal")).filter(|s|s.as_str() != "general"),
+            "vertical":alignment.and_then(|e|e.attrs.get("vertical")).filter(|s|s.as_str() != "bottom"),
+            "wrapText":alignment.is_some_and(|e|e.attrs.get("wrapText").is_some_and(|v|v=="1"||v=="true"))},
+        "numberFormat":numfmt(root,index(&xf,"numFmtId")?)}});
+    if value["baseStyleId"] == 0 {
+        value.as_object_mut().unwrap().remove("baseStyleId");
+    }
+    if value["style"]["numberFormat"]["builtInId"] == 0 {
+        value["style"]
+            .as_object_mut()
+            .unwrap()
+            .remove("numberFormat");
+    }
+    omit_defaults(&mut value);
+    Ok(value)
+}
+
+/// Compact objects omit absent/false components and the objects they empty.
+/// Keep numbers (including color index zero) and strings (including cell "").
+pub fn omit_defaults(value: &mut Value) {
+    if let Value::Object(object) = value {
+        object.retain(|_, value| {
+            omit_defaults(value);
+            !value.is_null()
+                && *value != Value::Bool(false)
+                && !value.as_object().is_some_and(|o| o.is_empty())
+        });
+    }
 }

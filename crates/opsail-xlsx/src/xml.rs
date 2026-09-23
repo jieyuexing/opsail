@@ -288,6 +288,59 @@ pub fn parse(source: &str) -> Result<Document, String> {
     Ok(document)
 }
 
+/// Capture source row bytes only after the worksheet has passed `parse` and
+/// namespace validation. These fragments keep untouched rows byte-identical.
+pub fn raw_rows(source: &str) -> Result<BTreeMap<u32, String>, String> {
+    let mut reader = Reader::from_str(source);
+    let mut parents: Vec<String> = Vec::new();
+    let mut active = None;
+    let mut rows = BTreeMap::new();
+    loop {
+        let start = reader.buffer_position() as usize;
+        match reader.read_event().map_err(|e| e.to_string())? {
+            Event::Start(e) | Event::Empty(e) => {
+                let name =
+                    String::from_utf8(e.name().as_ref().to_vec()).map_err(|e| e.to_string())?;
+                // Empty events can be distinguished by their literal terminator.
+                let end = reader.buffer_position() as usize;
+                let empty = source[..end].ends_with("/>");
+                if name.rsplit(':').next() == Some("row")
+                    && parents
+                        .last()
+                        .is_some_and(|p| p.rsplit(':').next() == Some("sheetData"))
+                {
+                    let element = element_from_start(&e, reader.decoder())?;
+                    let row = element
+                        .attrs
+                        .get("r")
+                        .and_then(|v| v.parse::<u32>().ok())
+                        .ok_or("invalid row index")?;
+                    if empty {
+                        rows.insert(row, source[start..end].into());
+                    } else {
+                        active = Some((row, start, parents.len()));
+                    }
+                }
+                if !empty {
+                    parents.push(name);
+                }
+            }
+            Event::End(_) => {
+                parents.pop();
+                if let Some((row, start, depth)) = active
+                    && parents.len() == depth
+                {
+                    rows.insert(row, source[start..reader.buffer_position() as usize].into());
+                    active = None;
+                }
+            }
+            Event::Eof => break,
+            _ => (),
+        }
+    }
+    Ok(rows)
+}
+
 fn element_from_start(
     start: &quick_xml::events::BytesStart<'_>,
     decoder: quick_xml::encoding::Decoder,

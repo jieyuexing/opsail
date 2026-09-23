@@ -1,11 +1,13 @@
 use super::{
-    Error, Operation, Result, invalid,
+    Error, Operation, Result, Style, invalid,
     package::Package,
     styles,
     xml::{self, Document, Element, Node},
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
+#[path = "insert_rows.rs"]
+mod insert_rows;
 const MAIN: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 const MAX_STORED_CELLS: usize = 200000;
@@ -25,12 +27,15 @@ pub struct Book {
     dirty: BTreeSet<String>,
     context: Value,
     signed: bool,
+    ancillary: BTreeMap<String, Vec<u8>>,
+    ancillary_updates: BTreeMap<String, Document>,
 }
+#[derive(Clone)]
 struct Sheet {
     part: String,
     doc: Document,
-    // Positions within sheetData/row children remain stable: v1 changes cell
-    // contents and attributes, never inserts or removes rows or cells.
+    // Physical XML child positions; insertion shifts the affected indexes.
+    touched_rows: BTreeSet<u32>,
     rows: BTreeMap<u32, usize>,
     cells: BTreeMap<String, (usize, usize)>,
     merged: Vec<Area>,
@@ -116,8 +121,8 @@ impl Book {
             .ok_or_else(|| invalid("a styles relationship is required for this capability"))?;
         let styles_doc = pkg.xml(&style_path)?;
         check_root(&styles_doc, "styleSheet")?;
-        let shared = if let Some(path) = shared_path {
-            let d = pkg.xml(&path)?;
+        let shared = if let Some(path) = &shared_path {
+            let d = pkg.xml(path)?;
             check_root(&d, "sst")?;
             d.root()
                 .map_err(invalid)?
@@ -180,7 +185,21 @@ impl Book {
         }
         let context = json!({"themeParts":pkg.parts.iter().filter(|(p,_)|p.starts_with("xl/theme/")).map(|(p,b)|(p.clone(),super::package::sha(b))).collect::<BTreeMap<_,_>>(),
             "indexedColors":styles_doc.root().map_err(invalid)?.child("colors").map(styles::canonical), "additionalStyleDefinitions":styles_doc.root().map_err(invalid)?.elements().filter(|e| !["numFmts","fonts","fills","borders","cellStyleXfs","cellXfs","colors"].contains(&e.local_name())).map(styles::canonical).collect::<Vec<_>>()});
+        let ancillary = pkg
+            .parts
+            .iter()
+            .filter(|(p, _)| {
+                (p.ends_with(".xml") || p.ends_with(".rels") || p.ends_with(".vml"))
+                    && *p != "xl/workbook.xml"
+                    && *p != &style_path
+                    && Some(p.as_str()) != shared_path.as_deref()
+                    && !sheets.values().any(|s| &s.part == *p)
+            })
+            .map(|(p, b)| (p.clone(), b.clone()))
+            .collect();
         Ok(Self {
+            ancillary,
+            ancillary_updates: BTreeMap::new(),
             sheets,
             styles: styles_doc,
             shared,
@@ -227,6 +246,96 @@ impl Book {
         );
         Ok(v)
     }
+    fn describe_compact(
+        &self,
+        name: &str,
+        cell: &str,
+        cache: &mut BTreeMap<usize, Value>,
+    ) -> Result<Value> {
+        let sheet = self.sheet(name)?;
+        let pos = address(cell)?;
+        let c = sheet.cell(cell)?;
+        let id = sheet.style_id(cell)?;
+        if let std::collections::btree_map::Entry::Vacant(entry) = cache.entry(id) {
+            entry.insert(styles::compact(&self.styles, id)?);
+        }
+        let mut result = cache[&id].clone();
+        // Avoid constructing canonical rich-string trees in compact mode.
+        let item = c.map(|c| self.string_item(c)).transpose()?.flatten();
+        let row = sheet.row(pos.1)?;
+        let column = sheet.column(pos.0)?;
+        let number = |e: Option<&Element>, key: &str| {
+            e.and_then(|e| e.attrs.get(key))
+                .and_then(|v| v.parse::<f64>().ok())
+        };
+        let value = c.and_then(|c| c.child("v")).map(Element::text);
+        result["sheet"] = json!(name);
+        result["cell"] = json!(cell);
+        result["blank"] = json!(c.is_none());
+        result["kind"] = json!(if item.is_some() {
+            "string"
+        } else {
+            c.map_or("blank", |c| c.attrs.get("t").map_or("n", String::as_str))
+        });
+        result["text"] = json!(item.map(string_text).or_else(|| {
+            c.filter(|c| c.attrs.get("t").is_some_and(|t| t == "str"))
+                .and(value.clone())
+        }));
+        result["value"] = if result["text"].is_null() {
+            json!(value)
+        } else {
+            Value::Null
+        };
+        result["formula"] = json!(c.is_some_and(|c| c.child("f").is_some()));
+        result["richText"] = json!(item.is_some_and(|i| i.child("r").is_some()));
+        result["merge"] = json!(
+            sheet
+                .merged
+                .iter()
+                .find(|m| m.contains(pos))
+                .map(|m| m.reference())
+        );
+        result["row"] = json!({"height":number(row,"ht"),"customHeight":row.is_some_and(|r|r.attrs.get("customHeight").is_some_and(|v|v=="1"||v=="true"))});
+        result["column"] = json!({"width":number(column,"width")});
+        let defaults = sheet.root()?.child("sheetFormatPr");
+        if result["row"]["customHeight"] == false
+            && number(row, "ht") == number(defaults, "defaultRowHeight")
+        {
+            result["row"].as_object_mut().unwrap().remove("height");
+        }
+        if number(column, "width") == number(defaults, "defaultColWidth") {
+            result["column"].as_object_mut().unwrap().remove("width");
+        }
+        styles::omit_defaults(&mut result);
+        Ok(result)
+    }
+    fn editable_text(&self, cell: Option<&Element>, numeric: bool) -> Result<String> {
+        let Some(c) = cell else {
+            return Ok(String::new());
+        };
+        if c.child("f").is_some() {
+            return Err(invalid("formula cells cannot be edited"));
+        }
+        let item = self.string_item(c)?;
+        if item.is_some_and(|i| i.elements().any(|e| e.local_name() != "t")) {
+            return Err(invalid(
+                "rich text or annotated string requires native application",
+            ));
+        }
+        if let Some(item) = item {
+            return Ok(string_text(item));
+        }
+        let kind = c.attrs.get("t").map(String::as_str).unwrap_or("n");
+        if let Some(v) = c.child("v") {
+            if kind == "str" || numeric && kind == "n" {
+                return Ok(v.text());
+            }
+            return Err(invalid(
+                "operation only accepts plain string or blank cells (setNumber also accepts numeric cells)",
+            ));
+        }
+        Ok(String::new())
+    }
     fn string_item<'a>(&'a self, c: &'a Element) -> Result<Option<&'a Element>> {
         match c.attrs.get("t").map(String::as_str) {
             Some("s") => {
@@ -265,7 +374,7 @@ impl Book {
             "extensions":c.elements().filter(|e|!["f","v","is"].contains(&e.local_name())).map(styles::canonical).collect::<Vec<_>>()}),
         )
     }
-    pub fn inspect(&self, ranges: &[String], max: usize) -> Result<Value> {
+    pub fn inspect(&self, ranges: &[String], max: usize, compact: bool) -> Result<Value> {
         let mut cells = Vec::new();
         let mut cache = BTreeMap::new();
         let mut total = 0usize;
@@ -289,12 +398,22 @@ impl Book {
                 sheet_info.insert(name.clone(), layout_summary(&s.layout()?));
             }
             for cell in area.iter_cells().take(max.saturating_sub(cells.len())) {
-                cells.push(self.describe(&name, &cell, &mut cache)?);
+                cells.push(if compact {
+                    self.describe_compact(&name, &cell, &mut cache)?
+                } else {
+                    self.describe(&name, &cell, &mut cache)?
+                });
             }
         }
-        Ok(
-            json!({"cells":cells,"totalCells":total,"truncated":total>max,"sheets":sheet_info,"styleContext":self.context,"styleComparison":"resolved stored style records, including inherited base; not rendered formatting"}),
-        )
+        let mut report =
+            json!({"cells":cells,"totalCells":total,"truncated":total>max,"sheets":sheet_info});
+        if !compact {
+            report["styleContext"] = self.context.clone();
+            report["styleComparison"] = json!(
+                "resolved stored style records, including inherited base; not rendered formatting"
+            );
+        }
+        Ok(report)
     }
     pub fn diff(&self, other: &Self, max: usize) -> Result<Value> {
         let mut total = 0usize;
@@ -367,6 +486,77 @@ impl Book {
             Entry::Vacant(e) => e.insert(styles::resolved(&self.styles, id)?),
         })
     }
+    /// Failed validation operations restore all mutable state, including append
+    /// caches and row/cell indexes. Normal patch failures never publish a book.
+    pub fn apply_bounded(
+        &mut self,
+        op: &Operation,
+        remaining: usize,
+        rollback: bool,
+    ) -> Result<usize> {
+        let name = op.sheet();
+        let sheet = self.sheet(name)?;
+        let targets = match op {
+            Operation::SetText { cell, .. }
+            | Operation::SetNumber { cell, .. }
+            | Operation::AppendText { cell, .. }
+            | Operation::SetFormula { cell, .. } => Some(Area::parse(cell)?),
+            Operation::SetStyle { range, .. } | Operation::CopyStyle { range, .. } => {
+                Some(Area::parse(range)?)
+            }
+            _ => None,
+        };
+        let count = match op {
+            Operation::InsertRows { count, .. } => *count as usize,
+            _ => targets.map_or(1, Area::len),
+        };
+        if count > remaining {
+            return Err(Error::Request(
+                "patch target budget exceeds 10000 cells/rows/columns".into(),
+            ));
+        }
+        if let Some(area) = targets {
+            let created = area
+                .iter_cells()
+                .filter(|c| !sheet.cells.contains_key(c))
+                .count();
+            if self.sheets.values().map(|s| s.cells.len()).sum::<usize>() + created
+                > MAX_STORED_CELLS
+            {
+                return Err(invalid(
+                    "workbook exceeds 200000 stored cells for edit/diff capability",
+                ));
+            }
+            for cell in area.iter_cells().filter(|c| !sheet.cells.contains_key(c)) {
+                sheet.check_merge(&Area::parse(&cell)?)?;
+            }
+        }
+        // insertRows stages every affected part and commits only on success.
+        if matches!(op, Operation::InsertRows { .. }) {
+            return self.apply(op);
+        }
+        let saved_sheet = rollback.then(|| sheet.clone());
+        let saved_styles = (rollback
+            && matches!(op, Operation::SetStyle { .. } | Operation::CopyStyle { .. }))
+        .then(|| (self.styles.clone(), self.append_cache.clone()));
+        let saved_workbook =
+            (rollback && matches!(op, Operation::SetFormula { .. })).then(|| self.workbook.clone());
+        let result = self.apply(op);
+        if result.is_err() {
+            if let Some(sheet) = saved_sheet {
+                self.sheets.insert(name.into(), sheet);
+            }
+            if let Some((styles, cache)) = saved_styles {
+                self.styles = styles;
+                self.append_cache = cache;
+            }
+            if let Some(workbook) = saved_workbook {
+                self.workbook = workbook;
+            }
+            // Dirty parts are marked only after a successful operation.
+        }
+        result
+    }
     pub fn apply(&mut self, op: &Operation) -> Result<usize> {
         if self.signed {
             return Err(invalid(
@@ -385,8 +575,62 @@ impl Book {
             return Err(invalid("protected worksheet requires native application"));
         }
         let part = sheet.part.clone();
-        let mut styles_changed = false;
+        let styles_revision = self.append_cache.revision();
         let count = match op {
+            Operation::InsertRows {
+                before,
+                count,
+                style_from,
+                ..
+            } => {
+                return self.insert_rows(name, *before, *count, style_from);
+            }
+            Operation::SetFormula {
+                cell,
+                expected_text,
+                formula,
+                ..
+            } => {
+                address(cell)?;
+                sheet.check_merge(&Area::parse(cell)?)?;
+                let formula = plain_formula(formula)?;
+                let old = if let Some(c) = sheet.cell(cell)? {
+                    if let Some(f) = c.child("f") {
+                        if f.attrs.get("t").is_some_and(|t| t != "normal") {
+                            return Err(invalid(
+                                "shared/array formulas require native application (including dataTable formulas)",
+                            ));
+                        }
+                        format!("={}", f.text())
+                    } else if c.attrs.get("t").is_some_and(|t| t == "b") {
+                        c.child("v").map(Element::text).unwrap_or_default()
+                    } else {
+                        self.editable_text(Some(c), true)?
+                    }
+                } else {
+                    String::new()
+                };
+                if has_excel_escape(&old) {
+                    return Err(invalid("OOXML escaped text requires native application"));
+                }
+                if &old != expected_text {
+                    return Err(Error::Request(format!(
+                        "expectedText does not match {name}!{cell}"
+                    )));
+                }
+                let c = self.sheets.get_mut(name).unwrap().cell_mut(cell)?;
+                c.attrs.remove("t");
+                c.children
+                    .retain(|n| !matches!(n, Node::Element(e) if e.local_name() == "f"));
+                let mut f = styles::make(c, "f");
+                f.children.push(Node::Text(formula.into()));
+                replace_value(c, f);
+                // Mark the workbook only after the cell write succeeds. A prior
+                // insertRows may already have dirtied definedNames, so the dirty
+                // flag alone cannot prove that recalculation was requested.
+                request_recalculation(&mut self.workbook)?;
+                1
+            }
             Operation::SetText {
                 cell,
                 expected_text,
@@ -398,30 +642,8 @@ impl Book {
                     return Err(invalid("setText requires one cell"));
                 }
                 sheet.check_merge(&area)?;
-                let c = sheet
-                    .cell(cell)?
-                    .ok_or_else(|| invalid("setText target must be an existing cell"))?;
-                if c.child("f").is_some() {
-                    return Err(invalid("formula cells cannot be edited as plain text"));
-                }
-                let item = self.string_item(c)?;
-                if item.is_some_and(|i| i.elements().any(|e| e.local_name() != "t")) {
-                    return Err(invalid(
-                        "rich text or annotated string requires native application",
-                    ));
-                }
-                let old = self.value(c)?;
-                let old = old["text"]
-                    .as_str()
-                    .or_else(|| {
-                        if c.child("v").is_none() {
-                            Some("")
-                        } else {
-                            None
-                        }
-                    })
-                    .ok_or_else(|| invalid("setText only accepts plain string or blank cells"))?;
-                if old != expected_text {
+                let old = self.editable_text(sheet.cell(cell)?, false)?;
+                if &old != expected_text {
                     return Err(Error::Request(format!(
                         "expectedText does not match {name}!{cell}"
                     )));
@@ -433,7 +655,7 @@ impl Book {
                 }
                 // OOXML reserves _xHHHH_ escape sequences. Encoding them correctly
                 // needs a separate text codec, so refuse ambiguous targets in v1.
-                if has_excel_escape(value) || has_excel_escape(old) {
+                if has_excel_escape(value) || has_excel_escape(&old) {
                     return Err(invalid("OOXML escaped text requires native application"));
                 }
                 let c = self.sheets.get_mut(name).unwrap().cell_mut(cell)?;
@@ -454,19 +676,113 @@ impl Book {
                 c.children.insert(at, Node::Element(is));
                 1
             }
+            Operation::SetNumber {
+                cell,
+                expected_text,
+                value,
+                ..
+            } => {
+                address(cell)?;
+                sheet.check_merge(&Area::parse(cell)?)?;
+                if !value.is_finite() {
+                    return Err(invalid("setNumber requires a finite number"));
+                }
+                let old = self.editable_text(sheet.cell(cell)?, true)?;
+                if &old != expected_text {
+                    return Err(Error::Request(format!(
+                        "expectedText does not match {name}!{cell}"
+                    )));
+                }
+                if has_excel_escape(&old) {
+                    return Err(invalid("OOXML escaped text requires native application"));
+                }
+                let c = self.sheets.get_mut(name).unwrap().cell_mut(cell)?;
+                c.attrs.remove("t");
+                let mut v = styles::make(c, "v");
+                v.children.push(Node::Text(value.to_string()));
+                replace_value(c, v);
+                1
+            }
+            Operation::AppendText {
+                cell,
+                expected_text,
+                value,
+                font_color,
+                bold,
+                strike,
+                ..
+            } => {
+                address(cell)?;
+                sheet.check_merge(&Area::parse(cell)?)?;
+                let old = self.editable_text(sheet.cell(cell)?, false)?;
+                if &old != expected_text {
+                    return Err(Error::Request(format!(
+                        "expectedText does not match {name}!{cell}"
+                    )));
+                }
+                if value.is_empty() {
+                    return Err(invalid("appendText value must not be empty"));
+                }
+                if old.encode_utf16().count() + value.encode_utf16().count() > 32767
+                    || value.chars().any(|c| !xml_char(c))
+                {
+                    return Err(invalid(
+                        "text exceeds Excel length or contains illegal XML characters",
+                    ));
+                }
+                if has_excel_escape(value) || has_excel_escape(&old) {
+                    return Err(invalid("OOXML escaped text requires native application"));
+                }
+                let id = sheet.style_id(cell)?;
+                let parent = sheet.root()?;
+                let mut inline = styles::make(parent, "is");
+                for (text, overrides) in [
+                    (&old, Style::default()),
+                    (
+                        value,
+                        Style {
+                            font_color: font_color.clone(),
+                            bold: *bold,
+                            strike: *strike,
+                            ..Style::default()
+                        },
+                    ),
+                ] {
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let mut run = styles::make(parent, "r");
+                    run.children.push(Node::Element(styles::run_properties(
+                        &self.styles,
+                        id,
+                        parent,
+                        &overrides,
+                    )?));
+                    let mut t = styles::make(parent, "t");
+                    t.attrs.insert("xml:space".into(), "preserve".into());
+                    t.children.push(Node::Text(text.clone()));
+                    run.children.push(Node::Element(t));
+                    inline.children.push(Node::Element(run));
+                }
+                let c = self.sheets.get_mut(name).unwrap().cell_mut(cell)?;
+                c.attrs.insert("t".into(), "inlineStr".into());
+                replace_value(c, inline);
+                1
+            }
             Operation::SetStyle { range, style, .. } => {
                 let area = Area::parse(range)?;
                 sheet.check_merge(&area)?;
                 let cells = area.cells();
                 let mut ids = Vec::new();
                 for cell in &cells {
-                    let c = sheet
-                        .cell(cell)?
-                        .ok_or_else(|| invalid(format!("style target {cell} must exist")))?;
+                    let c = sheet.cell(cell)?;
                     if (style.font_color.is_some()
                         || style.bold.is_some()
                         || style.strike.is_some())
-                        && self.string_item(c)?.is_some_and(|i| i.child("r").is_some())
+                        && c.map(|c| self.string_item(c))
+                            .transpose()?
+                            .flatten()
+                            .is_some_and(|i| i.child("r").is_some())
                     {
                         return Err(invalid(
                             "font edits on rich-text cells require native application",
@@ -495,7 +811,6 @@ impl Book {
                         .attrs
                         .insert("s".into(), id.to_string());
                 }
-                styles_changed = true;
                 cells.len()
             }
             Operation::CopyStyle {
@@ -513,11 +828,12 @@ impl Book {
                 let cells = area.cells();
                 let mut ids = Vec::new();
                 for cell in &cells {
-                    let c = sheet
-                        .cell(cell)?
-                        .ok_or_else(|| invalid("style target must exist"))?;
+                    let c = sheet.cell(cell)?;
                     if components.iter().any(|x| x == "font")
-                        && self.string_item(c)?.is_some_and(|i| i.child("r").is_some())
+                        && c.map(|c| self.string_item(c))
+                            .transpose()?
+                            .flatten()
+                            .is_some_and(|i| i.child("r").is_some())
                     {
                         return Err(invalid(
                             "font copy onto rich-text requires native application",
@@ -527,7 +843,7 @@ impl Book {
                 }
                 let mut cache = BTreeMap::new();
                 let mut assigned = Vec::new();
-                for id in ids {
+                for (cell, id) in cells.iter().zip(ids) {
                     let id = if let Some(new) = cache.get(&id) {
                         *new
                     } else {
@@ -537,7 +853,12 @@ impl Book {
                             id,
                             donor,
                             components,
-                        )?;
+                        )
+                        .map_err(|e| {
+                            invalid(format!(
+                                "target {name}!{cell}, donor {name}!{from_cell}: {e}"
+                            ))
+                        })?;
                         cache.insert(id, new);
                         new
                     };
@@ -551,7 +872,6 @@ impl Book {
                         .attrs
                         .insert("s".into(), id.to_string());
                 }
-                styles_changed = true;
                 cells.len()
             }
             Operation::RowHeight { row, height, .. } => {
@@ -582,8 +902,11 @@ impl Book {
             }
         };
         self.dirty.insert(part);
-        if styles_changed {
+        if self.append_cache.revision() != styles_revision {
             self.dirty.insert(self.style_path.clone());
+        }
+        if matches!(op, Operation::SetFormula { .. }) {
+            self.dirty.insert("xl/workbook.xml".into());
         }
         Ok(count)
     }
@@ -592,6 +915,10 @@ impl Book {
         for part in &self.dirty {
             let doc = if part == &self.style_path {
                 &self.styles
+            } else if part == "xl/workbook.xml" {
+                &self.workbook
+            } else if let Some(doc) = self.ancillary_updates.get(part) {
+                doc
             } else {
                 &self
                     .sheets
@@ -600,7 +927,36 @@ impl Book {
                     .ok_or_else(|| invalid("dirty sheet missing"))?
                     .doc
             };
-            let bytes = doc.serialize().into_bytes();
+            let bytes = if part == &self.style_path
+                || part == "xl/workbook.xml"
+                || self.ancillary_updates.contains_key(part)
+            {
+                doc.serialize().into_bytes()
+            } else {
+                let sheet = self.sheets.values().find(|s| &s.part == part).unwrap();
+                let original = source
+                    .parts
+                    .get(part)
+                    .ok_or_else(|| invalid("source sheet missing"))?;
+                let raw_rows = xml::raw_rows(
+                    std::str::from_utf8(original).map_err(|e| invalid(e.to_string()))?,
+                )
+                .map_err(invalid)?;
+                let mut preserved = doc.clone();
+                let data = preserved
+                    .root_mut()
+                    .map_err(invalid)?
+                    .child_mut("sheetData")
+                    .unwrap();
+                for (row, position) in &sheet.rows {
+                    if !sheet.touched_rows.contains(row)
+                        && let Some(raw) = raw_rows.get(row)
+                    {
+                        data.children[*position] = Node::Raw(raw.clone());
+                    }
+                }
+                preserved.serialize().into_bytes()
+            };
             xml::parse(std::str::from_utf8(&bytes).unwrap()).map_err(invalid)?;
             if source.parts.get(part) != Some(&bytes) {
                 result.insert(part.clone(), bytes);
@@ -608,6 +964,57 @@ impl Book {
         }
         Ok(result)
     }
+}
+fn plain_formula(formula: &str) -> Result<&str> {
+    let expression = formula.strip_prefix('=').unwrap_or(formula);
+    if expression.is_empty()
+        || expression.encode_utf16().count() > 8192
+        || expression.chars().any(|c| !xml_char(c))
+    {
+        return Err(invalid(
+            "formula must contain 1-8192 UTF-16 units and legal XML characters",
+        ));
+    }
+    if has_excel_escape(expression) {
+        return Err(invalid("OOXML escaped text requires native application"));
+    }
+    // The protocol accepts expression text, never an OOXML formula record or
+    // Excel's legacy CSE {=...} wrapper. Normal array constants remain text.
+    let trimmed = expression.trim();
+    if trimmed.starts_with("{=") || trimmed.starts_with('<') {
+        return Err(invalid(
+            "shared/array formulas require native application (including dataTable formulas); supply a plain formula expression",
+        ));
+    }
+    Ok(expression)
+}
+fn request_recalculation(workbook: &mut Document) -> Result<()> {
+    let root = workbook.root_mut().map_err(invalid)?;
+    if root.child("calcPr").is_none() {
+        let calc = styles::make(root, "calcPr");
+        // CT_Workbook places calcPr after definedNames and before these
+        // optional successors. Existing sheets and definedNames stay in place.
+        let at = root.children.iter().position(|n| matches!(n, Node::Element(e)
+            if ["oleSize", "customWorkbookViews", "pivotCaches", "smartTagPr", "smartTagTypes",
+                "webPublishing", "fileRecoveryPr", "webPublishObjects", "extLst"].contains(&e.local_name())))
+            .unwrap_or(root.children.len());
+        root.children.insert(at, Node::Element(calc));
+    }
+    root.child_mut("calcPr")
+        .unwrap()
+        .attrs
+        .insert("fullCalcOnLoad".into(), "1".into());
+    Ok(())
+}
+fn replace_value(cell: &mut Element, value: Element) {
+    cell.children
+        .retain(|n| !matches!(n,Node::Element(e) if ["v","is"].contains(&e.local_name())));
+    let at = cell
+        .children
+        .iter()
+        .position(|n| matches!(n,Node::Element(e) if e.local_name()=="extLst"))
+        .unwrap_or(cell.children.len());
+    cell.children.insert(at, Node::Element(value));
 }
 fn string_text(item: &Element) -> String {
     item.elements()
@@ -718,6 +1125,7 @@ impl Sheet {
             rows,
             cells,
             merged,
+            touched_rows: BTreeSet::new(),
         })
     }
     fn row(&self, n: u32) -> Result<Option<&Element>> {
@@ -733,10 +1141,35 @@ impl Sheet {
         if n == 0 || n > 1048576 {
             return Err(invalid("row outside Excel bounds"));
         }
-        let pos = *self
-            .rows
-            .get(&n)
-            .ok_or_else(|| invalid("target row must already exist"))?;
+        if !self.rows.contains_key(&n) {
+            let mut row = styles::make(self.data()?, "row");
+            row.attrs.insert("r".into(), n.to_string());
+            let position = self
+                .rows
+                .range(n..)
+                .next()
+                .map_or(self.data()?.children.len(), |(_, p)| *p);
+            self.doc
+                .root_mut()
+                .map_err(invalid)?
+                .child_mut("sheetData")
+                .unwrap()
+                .children
+                .insert(position, Node::Element(row));
+            for p in self.rows.values_mut() {
+                if *p >= position {
+                    *p += 1;
+                }
+            }
+            for (r, _) in self.cells.values_mut() {
+                if *r >= position {
+                    *r += 1;
+                }
+            }
+            self.rows.insert(n, position);
+        }
+        self.touched_rows.insert(n);
+        let pos = self.rows[&n];
         let data = self
             .doc
             .root_mut()
@@ -753,11 +1186,43 @@ impl Sheet {
             .transpose()
     }
     fn cell_mut(&mut self, cell: &str) -> Result<&mut Element> {
-        address(cell)?;
-        let (r, c) = *self
-            .cells
-            .get(cell)
-            .ok_or_else(|| invalid("target cell must already exist"))?;
+        let (column, row) = address(cell)?;
+        if !self.cells.contains_key(cell) {
+            if self.cells.len() >= MAX_STORED_CELLS {
+                return Err(invalid("worksheet exceeds 200000 stored cells"));
+            }
+            let inherited = self.inherited_style(column, row)?;
+            let mut created = styles::make(self.root()?, "c");
+            created.attrs.insert("r".into(), cell.into());
+            if let Some(id) = inherited {
+                created.attrs.insert("s".into(), id.to_string());
+            }
+            self.extend_dimension(column, row)?;
+            let r = self.row_mut(row)?;
+            let position = r
+                .children
+                .iter()
+                .position(|node| match node {
+                    Node::Element(e) if e.local_name() == "c" => e
+                        .attrs
+                        .get("r")
+                        .and_then(|s| address(s).ok())
+                        .is_some_and(|p| p.0 > column),
+                    Node::Element(e) => e.local_name() == "extLst",
+                    _ => false,
+                })
+                .unwrap_or(r.children.len());
+            r.children.insert(position, Node::Element(created));
+            let row_position = self.rows[&row];
+            for (r, c) in self.cells.values_mut() {
+                if *r == row_position && *c >= position {
+                    *c += 1;
+                }
+            }
+            self.cells.insert(cell.into(), (row_position, position));
+        }
+        self.touched_rows.insert(row);
+        let (r, c) = self.cells[cell];
         let data = self
             .doc
             .root_mut()
@@ -776,6 +1241,37 @@ impl Sheet {
             }
         }
         Ok(None)
+    }
+    fn inherited_style(&self, column: u32, row: u32) -> Result<Option<u32>> {
+        if let Some(r) = self.row(row)?
+            && r.attrs
+                .get("customFormat")
+                .is_some_and(|v| v == "1" || v == "true")
+        {
+            return Ok(Some(attr_u32(r, "s", 0)?));
+        }
+        self.column(column)?
+            .filter(|c| c.attrs.contains_key("style"))
+            .map(|c| attr_u32(c, "style", 0))
+            .transpose()
+    }
+    fn extend_dimension(&mut self, column: u32, row: u32) -> Result<()> {
+        let Some(dimension) = self.doc.root_mut().map_err(invalid)?.child_mut("dimension") else {
+            return Ok(());
+        };
+        let reference = dimension
+            .attrs
+            .get("ref")
+            .ok_or_else(|| invalid("dimension reference missing"))?;
+        let mut area = Area::parse_unbounded(reference)?;
+        if !area.contains((column, row)) {
+            area.left = area.left.min(column);
+            area.right = area.right.max(column);
+            area.top = area.top.min(row);
+            area.bottom = area.bottom.max(row);
+            dimension.attrs.insert("ref".into(), area.reference());
+        }
+        Ok(())
     }
     fn style_id(&self, cell: &str) -> Result<usize> {
         let p = address(cell)?;
@@ -989,3 +1485,7 @@ fn column_name(mut n: u32) -> String {
     }
     s.into_iter().rev().collect()
 }
+
+#[cfg(test)]
+#[path = "protocol_tests.rs"]
+mod protocol_tests;

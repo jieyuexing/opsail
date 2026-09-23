@@ -173,6 +173,9 @@ impl Package {
         for name in updates.keys() {
             candidate.xml(name)?;
         }
+        // A syntactically valid part is insufficient: verify indexes, style
+        // relationships and worksheet structure using the edit loader too.
+        super::workbook::Book::load(&candidate)?;
         // Re-read the original just before publishing. Editing operates only on
         // the immutable snapshot; no source bytes are ever written.
         if sha(&read_bounded(source, limits.compressed)?) != self.sha() {
