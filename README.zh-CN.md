@@ -53,11 +53,16 @@ opsail refit codex enable usage --launch
 
 支持目标、附加与启动模式、生命周期语义、renderer 更新、多语言、安全校验和库 API 请参阅 [`opsail-refit-codex`](https://github.com/lencx/opsail/blob/main/crates/opsail-refit-codex/README.md)。
 
+### Gateway API 与模型调用
+
+`opsail gateway` 使用主密码加密保存连接与密钥，统一调用 HTTP API、兼容云端／本地模型和 Vercel Jev 评估。CLI 与 Node 返回有边界的完整 JSON／文本结果；密码输入显示 `*`。参见 [Gateway 指南](https://github.com/lencx/opsail/blob/main/crates/opsail-gateway/README.md)。
+
 ## 包结构
 
 | 包 | 职责 | 文档 |
 | --- | --- | --- |
 | [`opsail`](https://crates.io/crates/opsail) | 原生 CLI 与统一命令入口 | 运行 `opsail --help` |
+| `opsail-gateway` | 加密连接、HTTP 调用与模型协议 | [README](https://github.com/lencx/opsail/blob/main/crates/opsail-gateway/README.md) |
 | [`opsail-read`](https://crates.io/crates/opsail-read) | 内容获取、正文提取、清理和结果契约 | [README](https://github.com/lencx/opsail/blob/main/crates/opsail-read/README.md) |
 | [`opsail-chrome`](https://crates.io/crates/opsail-chrome) | 跨平台 Chrome 生命周期、CDP 传输和渲染捕获 | [README](https://github.com/lencx/opsail/blob/main/crates/opsail-chrome/README.md) |
 | [`opsail-refit-codex`](https://crates.io/crates/opsail-refit-codex) | Codex 适配生命周期、额度语义、多语言和 UI payload | [README](https://github.com/lencx/opsail/blob/main/crates/opsail-refit-codex/README.md) |

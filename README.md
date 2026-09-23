@@ -53,11 +53,16 @@ Interactive waits show their current validated lifecycle stage on `stderr`, whil
 
 See [`opsail-refit-codex`](https://github.com/lencx/opsail/blob/main/crates/opsail-refit-codex/README.md) for supported targets, attach and launch modes, lifecycle semantics, renderer updates, localization, security checks, and library APIs.
 
+### Gateway APIs and models
+
+`opsail gateway` stores connections and credentials in a passphrase-encrypted vault and calls HTTP APIs, OpenAI-compatible cloud/local models, and Vercel Jev evaluation. CLI and Node calls return complete, bounded JSON/text results. See the [Gateway guide](https://github.com/lencx/opsail/blob/main/crates/opsail-gateway/README.md).
+
 ## Packages
 
 | Package | Responsibility | Documentation |
 | --- | --- | --- |
 | [`opsail`](https://crates.io/crates/opsail) | Native CLI and unified command entry point | Run `opsail --help` |
+| `opsail-gateway` | Encrypted connections and HTTP/model protocols | [README](https://github.com/lencx/opsail/blob/main/crates/opsail-gateway/README.md) |
 | [`opsail-read`](https://crates.io/crates/opsail-read) | Content acquisition, extraction, sanitization, and result contracts | [README](https://github.com/lencx/opsail/blob/main/crates/opsail-read/README.md) |
 | [`opsail-chrome`](https://crates.io/crates/opsail-chrome) | Cross-platform Chrome lifecycle, CDP transport, and rendered capture | [README](https://github.com/lencx/opsail/blob/main/crates/opsail-chrome/README.md) |
 | [`opsail-refit-codex`](https://crates.io/crates/opsail-refit-codex) | Validated Codex refit lifecycle, usage semantics, localization, and UI payload | [README](https://github.com/lencx/opsail/blob/main/crates/opsail-refit-codex/README.md) |

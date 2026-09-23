@@ -1,0 +1,35 @@
+name: Gateway checks
+on:
+  pull_request:
+    paths:
+      - 'crates/opsail-gateway/**'
+      - 'crates/opsail/**'
+      - 'packages/node/**'
+      - 'Cargo.*'
+      - '.github/workflows/gateway.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  gateway:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: cargo fmt --all -- --check
+      - run: cargo test --workspace --locked
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - run: cargo build --release --workspace --locked
+      - run: npm test --prefix packages/node
+      - if: runner.os != 'Windows'
+        run: python3 crates/opsail/tests/gateway_terminal.py target/debug/opsail
+      - run: npm run pack:check --prefix packages/node

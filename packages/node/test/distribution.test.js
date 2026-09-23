@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -34,6 +34,9 @@ test("packed packages resolve and run the native binary without an override", as
       mkdir(tarballRoot, { recursive: true }),
       mkdir(installRoot, { recursive: true }),
     ]);
+    // A TMPDIR inside another repository must not let npm walk up to and modify
+    // that repository's package.json. Give the fixture its own package boundary.
+    await writeFile(path.join(installRoot, "package.json"), JSON.stringify({ name: "opsail-distribution-fixture", private: true }));
     await buildPlatformPackage({
       rustTarget: target.rustTarget,
       binaryPath,
@@ -46,6 +49,8 @@ test("packed packages resolve and run the native binary without an override", as
       npmCommand,
       [
         "install",
+        "--prefix",
+        installRoot,
         "--offline",
         "--omit=optional",
         "--ignore-scripts",

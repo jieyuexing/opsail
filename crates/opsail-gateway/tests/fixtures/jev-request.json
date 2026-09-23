@@ -1,0 +1,8 @@
+{
+  "state": "The support agent issued a full refund to the customer.",
+  "questions": {
+    "refunded": { "type": "boolean", "instructions": "Was a refund issued?" },
+    "outcome": { "type": "choice", "instructions": "Classify the outcome.", "criteria": { "refund": "Money was returned.", "none": null } },
+    "completion": { "type": "score", "instructions": "Rate completion.", "criteria": ["Not completed.", "Completed."] }
+  }
+}

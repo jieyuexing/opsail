@@ -1,0 +1,11 @@
+{
+  "answers": {
+    "refunded": { "type": "boolean", "probability": 0.98 },
+    "outcome": { "type": "choice", "choice": "refund", "probabilities": { "refund": 0.98, "none": 0.02 } },
+    "completion": { "type": "score", "score": 0.98, "probabilities": { "0": 0.02, "1": 0.98 } }
+  },
+  "rounding": { "probabilityDecimals": 2, "scoreDecimals": 2 },
+  "usage": { "inputTokens": 30, "outputTokens": 12 },
+  "warnings": [],
+  "providerMetadata": {}
+}

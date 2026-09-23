@@ -2,6 +2,11 @@ import { createOpsail } from "./client.js";
 
 let defaultClient;
 
+export async function gateway(request, options) {
+  defaultClient ??= createOpsail();
+  return defaultClient.gateway(request, options);
+}
+
 export async function read(request, options) {
   defaultClient ??= createOpsail();
   return defaultClient.read(request, options);

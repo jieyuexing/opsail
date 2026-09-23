@@ -13,6 +13,7 @@ Thank you for helping improve Opsail. Keep changes focused on one observable beh
 
 ```text
 crates/opsail          Native CLI parsing, protocol routing, diagnostics, and exit behavior
+crates/opsail-gateway Encrypted connections, bounded HTTP calls, and model protocols
 crates/opsail-chrome   Chrome executable discovery, owned lifecycle, CDP, and DOM capture
 crates/opsail-read     Source orchestration, HTML acquisition, extraction, sanitization, and result schema
 crates/opsail-refit-codex Codex refit lifecycle, target safety, and renderer integration

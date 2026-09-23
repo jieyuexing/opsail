@@ -14,6 +14,7 @@ use url::Url;
 
 mod activity;
 mod codex;
+mod gateway;
 mod machine;
 
 const PROPERTY_NAMES: &str = "content, markdown, contentHtml, html, title, author, description, site, published, modified, image, favicon, language, direction, url, canonicalUrl, domain, wordCount, quality, source, extraction";
@@ -38,6 +39,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Manage encrypted connections and call HTTP APIs or models.
+    Gateway(gateway::GatewayArgs),
     /// Read a URL or HTML input and extract its primary content.
     #[command(visible_alias = "extract")]
     Read(Box<ReadArgs>),
@@ -216,6 +219,7 @@ async fn async_main() -> ExitCode {
 
 async fn execute(command: Command) -> ExitCode {
     match command {
+        Command::Gateway(args) => gateway::run(args).await,
         Command::Read(args) if args.machine => machine::run().await,
         command => match run(command).await {
             Ok(()) => ExitCode::SUCCESS,
@@ -310,6 +314,7 @@ fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
 
 async fn run(command: Command) -> Result<()> {
     match command {
+        Command::Gateway(_) => unreachable!("gateway handled by execute"),
         Command::Read(args) => run_read(*args).await,
         Command::Refit(args) => run_refit(args).await,
     }
