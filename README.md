@@ -38,7 +38,7 @@ See [`opsail-read`](https://github.com/lencx/opsail/blob/main/crates/opsail-read
 
 ### Query remaining usage
 
-`opsail usage` reports remaining windows from supported CLI providers. Codex and Grok are currently supported. Pass a provider name to query only that provider.
+`opsail usage` reports remaining windows from Claude, Codex and Grok. Pass a provider name (for example, `opsail usage claude`) to query only that provider. Claude includes five-hour, weekly and model-specific windows; see the [usage contract](crates/opsail-usage/README.md).
 
 ### Refit Codex
 

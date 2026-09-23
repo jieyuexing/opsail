@@ -34,9 +34,14 @@ pub struct UsageOptions {
     pub codex_path: Option<PathBuf>,
     /// Explicit Grok CLI auth file. When omitted, resolve `OPSAIL_GROK_AUTH` then `~/.grok/auth.json`.
     pub grok_auth_path: Option<PathBuf>,
+    /// Explicit Claude Code credentials file; bypasses Keychain when set.
+    /// Otherwise use OPSAIL_CLAUDE_AUTH, then the Claude Code credential stores.
+    pub claude_auth_path: Option<PathBuf>,
     pub timeout: Duration,
     pub client: ClientInfo,
     pub(crate) grok_endpoint: Option<String>,
+    #[cfg(test)]
+    pub(crate) claude_endpoint: Option<String>,
 }
 
 impl Default for UsageOptions {
@@ -45,9 +50,12 @@ impl Default for UsageOptions {
             providers: Vec::new(),
             codex_path: None,
             grok_auth_path: None,
+            claude_auth_path: None,
             timeout: DEFAULT_TIMEOUT,
             client: ClientInfo::default(),
             grok_endpoint: None,
+            #[cfg(test)]
+            claude_endpoint: None,
         }
     }
 }
@@ -73,15 +81,17 @@ impl UsageOptions {
 pub enum UsageProvider {
     Codex,
     Grok,
+    Claude,
 }
 
 impl UsageProvider {
-    pub const ALL: [Self; 2] = [Self::Codex, Self::Grok];
+    pub const ALL: [Self; 3] = [Self::Codex, Self::Grok, Self::Claude];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Codex => "codex",
             Self::Grok => "grok",
+            Self::Claude => "claude",
         }
     }
 
@@ -89,6 +99,7 @@ impl UsageProvider {
         match self {
             Self::Codex => "Codex",
             Self::Grok => "Grok",
+            Self::Claude => "Claude",
         }
     }
 }
@@ -113,6 +124,18 @@ pub struct UsageSnapshot {
     pub reset_credit_expires_at: Option<u64>,
 }
 
+/// One named subscription window. Reset times use Unix seconds, like the legacy fields.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageWindow {
+    pub id: String,
+    pub remaining_percent: u8,
+    pub used_percent: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<u64>,
+    pub window_duration_mins: f64,
+}
+
 /// One provider row in a usage report.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -135,6 +158,9 @@ pub struct UsageEntry {
     pub reset_credit_expires_at: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Optional multi-window extension to schema version 1. Legacy providers omit it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub windows: Option<Vec<UsageWindow>>,
 }
 
 impl UsageEntry {
@@ -150,6 +176,7 @@ impl UsageEntry {
             reset_credit_available_count: snapshot.reset_credit_available_count,
             reset_credit_expires_at: snapshot.reset_credit_expires_at,
             detail: None,
+            windows: None,
         }
     }
 
@@ -165,6 +192,7 @@ impl UsageEntry {
             reset_credit_available_count: snapshot.reset_credit_available_count,
             reset_credit_expires_at: snapshot.reset_credit_expires_at,
             detail: None,
+            windows: None,
         }
     }
 
@@ -180,6 +208,7 @@ impl UsageEntry {
             reset_credit_available_count: None,
             reset_credit_expires_at: None,
             detail: Some(detail.into()),
+            windows: None,
         }
     }
 }
@@ -354,5 +383,23 @@ mod tests {
             super::UsageOptions::default().selected_providers(),
             UsageProvider::ALL.to_vec()
         );
+    }
+
+    #[test]
+    fn legacy_provider_json_does_not_gain_a_windows_field() {
+        let snapshot = snapshot_from_rate_limits(&json!({
+            "rateLimits": { "primary": { "usedPercent": 20 } }
+        }))
+        .unwrap();
+        for entry in [
+            super::UsageEntry::from_codex(snapshot.clone()),
+            super::UsageEntry::from_grok(snapshot),
+        ] {
+            let encoded = serde_json::to_value(entry).unwrap();
+            assert_eq!(encoded.as_object().unwrap().len(), 4);
+            assert_eq!(encoded["remainingPercent"], 80);
+            assert_eq!(encoded["usedPercent"], 20.0);
+            assert!(encoded.get("windows").is_none());
+        }
     }
 }

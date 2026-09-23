@@ -38,7 +38,7 @@ opsail read ./book.xlsx --max-bytes 67108864 --range 'Summary!A1:H30' --format j
 
 ### 查询用量
 
-`opsail usage` 查询当前支持的 CLI provider 剩余额度。目前支持 Codex 和 Grok；传入 provider 名称时只查询对应 provider。
+`opsail usage` 查询 Claude、Codex 和 Grok 的剩余额度；传入 provider 名称（例如 `opsail usage claude`）时只查询对应 provider。Claude 返回五小时、每周及按模型的多个窗口，详见 [usage 合同](crates/opsail-usage/README.md)。
 
 ### Codex Refit
 

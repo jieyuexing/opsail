@@ -50,7 +50,7 @@ enum Command {
     /// Read a URL, HTML input, or XLSX workbook.
     #[command(visible_alias = "extract")]
     Read(Box<ReadArgs>),
-    /// Read remaining Codex and Grok CLI rate-limit windows.
+    /// Read remaining Claude, Codex and Grok CLI rate-limit windows.
     Usage(usage::UsageArgs),
     /// Apply a reversible, target-validated application refit.
     Refit(RefitArgs),

@@ -956,10 +956,12 @@ fn usage_help_describes_supported_providers() {
     let mut command = cargo_bin_cmd!("opsail");
     command.args(["usage", "--help"]).assert().success().stdout(
         predicate::str::contains("codex")
+            .and(predicate::str::contains("claude"))
             .and(predicate::str::contains("grok"))
             .and(predicate::str::contains("codex app-server"))
             .and(predicate::str::contains("--codex-path"))
             .and(predicate::str::contains("--grok-auth"))
+            .and(predicate::str::contains("--claude-auth"))
             .and(predicate::str::contains("does not attach to ChatGPT.app")),
     );
 }
@@ -968,11 +970,11 @@ fn usage_help_describes_supported_providers() {
 fn usage_unknown_provider_is_a_clap_usage_error() {
     let mut command = cargo_bin_cmd!("opsail");
     command
-        .args(["usage", "claude"])
+        .args(["usage", "unknown"])
         .assert()
         .code(2)
         .stdout("")
-        .stderr(predicate::str::contains("invalid value 'claude'"));
+        .stderr(predicate::str::contains("invalid value 'unknown'"));
 }
 
 #[test]
@@ -1010,6 +1012,8 @@ fn usage_without_provider_returns_every_supported_runtime() {
             "/opsail-missing-codex/codex",
             "--grok-auth",
             "/opsail-missing-grok/auth.json",
+            "--claude-auth",
+            "/opsail-missing-claude/credentials.json",
         ])
         .assert()
         .success()
@@ -1020,7 +1024,37 @@ fn usage_without_provider_returns_every_supported_runtime() {
     assert_eq!(value["providers"][1]["provider"], "grok");
     assert_eq!(value["providers"][0]["status"], "unavailable");
     assert_eq!(value["providers"][1]["status"], "unavailable");
-    assert_eq!(value["providers"].as_array().unwrap().len(), 2);
+    assert_eq!(value["providers"][2]["provider"], "claude");
+    assert_eq!(value["providers"][2]["status"], "unavailable");
+    assert_eq!(value["providers"].as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn usage_claude_invalid_login_is_unavailable_and_never_prints_credentials() {
+    let directory = tempdir().unwrap();
+    let auth = directory.path().join("credentials.json");
+    let content = r#"{"claudeAiOauth":{"accessToken":"private-access-token","refreshToken":"private-refresh-token","expiresAt":1}}"#;
+    fs::write(&auth, content).unwrap();
+    for format in ["json", "text"] {
+        let mut command = cargo_bin_cmd!("opsail");
+        let assert = command
+            .args(["usage", "claude", "--format", format, "--claude-auth"])
+            .arg(&auth)
+            .assert()
+            .success()
+            .stderr("");
+        let output = String::from_utf8_lossy(&assert.get_output().stdout);
+        assert!(output.contains("claude auth login"));
+        assert!(!output.contains("private-"));
+        assert!(!output.contains(&auth.display().to_string()));
+        if format == "json" {
+            let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(value["schemaVersion"], 1);
+            assert_eq!(value["providers"][0]["provider"], "claude");
+            assert_eq!(value["providers"][0]["status"], "unavailable");
+        }
+    }
+    assert_eq!(fs::read_to_string(auth).unwrap(), content);
 }
 
 #[cfg(unix)]

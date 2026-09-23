@@ -13,13 +13,13 @@ use tokio::process::Command;
 use tokio::time::timeout;
 
 use crate::error::UsageError;
-use crate::grok;
 use crate::model::{
     SCHEMA_VERSION, UsageEntry, UsageOptions, UsageProvider, UsageReport, UsageSnapshot,
     snapshot_from_rate_limits,
 };
 use crate::resolve::resolve_codex_executable;
 use crate::rpc::JsonRpc;
+use crate::{claude, grok};
 
 /// Read remaining-usage windows for the selected providers.
 pub async fn read_usage(options: &UsageOptions) -> UsageReport {
@@ -38,6 +38,12 @@ pub async fn read_usage(options: &UsageOptions) -> UsageReport {
 
 async fn read_provider(provider: UsageProvider, options: &UsageOptions) -> UsageEntry {
     match provider {
+        UsageProvider::Claude => {
+            match timeout(options.timeout, claude::read_claude_usage(options)).await {
+                Ok(entry) => entry,
+                Err(_) => UsageEntry::unavailable(provider, "the Claude usage query timed out"),
+            }
+        }
         UsageProvider::Codex => match timeout(options.timeout, read_codex_usage(options)).await {
             Ok(Ok(snapshot)) => UsageEntry::from_codex(snapshot),
             Ok(Err(error)) => UsageEntry::unavailable(provider, error.to_string()),
@@ -336,6 +342,20 @@ write_frame({
         )
         .unwrap();
         let server = MockServer::start().await;
+        let claude_auth = directory.path().join("claude.json");
+        fs::write(
+            &claude_auth,
+            json!({ "claudeAiOauth": {
+                "accessToken": "fixture-claude", "expiresAt": 4_070_908_800_000u64
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        Mock::given(method("GET"))
+            .and(path("/api/oauth/usage"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+            .mount(&server)
+            .await;
         Mock::given(method("POST"))
             .and(path("/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig"))
             .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
@@ -346,6 +366,8 @@ write_frame({
         let report = read_usage(&UsageOptions {
             codex_path: Some(codex),
             grok_auth_path: Some(auth_path),
+            claude_auth_path: Some(claude_auth),
+            claude_endpoint: Some(format!("{}/api/oauth/usage", server.uri())),
             timeout: Duration::from_millis(100),
             grok_endpoint: Some(format!(
                 "{}/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig",
@@ -355,7 +377,7 @@ write_frame({
         })
         .await;
         assert!(started.elapsed() < Duration::from_secs(1));
-        assert_eq!(report.providers.len(), 2);
+        assert_eq!(report.providers.len(), 3);
         assert!(report.providers.iter().all(|entry| {
             entry.status == UsageStatus::Unavailable
                 && entry.detail.as_deref().unwrap_or("").contains("timed out")

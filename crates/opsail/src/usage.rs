@@ -11,7 +11,7 @@ use crate::{parse_positive_u64, with_trailing_newline, write_stdout};
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Supported providers: codex, grok. When PROVIDER is omitted, query every supported provider. Codex uses a short-lived official `codex app-server`. Grok uses the CLI sign-in file and grok.com billing. This does not attach to ChatGPT.app, change the Codex sidebar, or print credentials. Codex resolution is --codex-path, then OPSAIL_CODEX_PATH, then PATH. Grok auth is --grok-auth, then OPSAIL_GROK_AUTH, then ~/.grok/auth.json."
+    after_help = "Supported providers: claude, codex, grok. When PROVIDER is omitted, query every supported provider. Claude reads Claude Code credentials and the official subscription usage endpoint, without login or token refresh. Codex uses a short-lived official `codex app-server`. Grok uses the CLI sign-in file and grok.com billing. This does not attach to ChatGPT.app, change the Codex sidebar, or print credentials. Claude auth is --claude-auth, then OPSAIL_CLAUDE_AUTH, then macOS Keychain or CLAUDE_CONFIG_DIR/.credentials.json (default ~/.claude). Codex resolution is --codex-path, then OPSAIL_CODEX_PATH, then PATH. Grok auth is --grok-auth, then OPSAIL_GROK_AUTH, then ~/.grok/auth.json."
 )]
 pub(crate) struct UsageArgs {
     /// Provider to query. When omitted, query every supported provider.
@@ -30,6 +30,10 @@ pub(crate) struct UsageArgs {
     #[arg(long, value_name = "PATH")]
     grok_auth: Option<PathBuf>,
 
+    /// Claude Code credentials JSON path (bypasses Keychain).
+    #[arg(long, value_name = "PATH")]
+    claude_auth: Option<PathBuf>,
+
     /// Overall provider query timeout in seconds.
     #[arg(long, value_name = "SECONDS", value_parser = parse_positive_u64)]
     timeout: Option<u64>,
@@ -37,6 +41,7 @@ pub(crate) struct UsageArgs {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum UsageProviderArg {
+    Claude,
     Codex,
     Grok,
 }
@@ -50,6 +55,7 @@ enum UsageFormat {
 impl From<UsageProviderArg> for UsageProvider {
     fn from(value: UsageProviderArg) -> Self {
         match value {
+            UsageProviderArg::Claude => Self::Claude,
             UsageProviderArg::Codex => Self::Codex,
             UsageProviderArg::Grok => Self::Grok,
         }
@@ -61,6 +67,7 @@ pub(crate) async fn run(args: UsageArgs) -> Result<()> {
     options.providers = args.provider.into_iter().map(UsageProvider::from).collect();
     options.codex_path = args.codex_path;
     options.grok_auth_path = args.grok_auth;
+    options.claude_auth_path = args.claude_auth;
     options.timeout = args
         .timeout
         .map(Duration::from_secs)
@@ -101,6 +108,17 @@ fn format_entry(entry: &UsageEntry) -> String {
             if let Some(resets_at) = entry.resets_at {
                 line.push_str("\tresets ");
                 line.push_str(&resets_at.to_string());
+            }
+            if let Some(windows) = &entry.windows {
+                for window in windows {
+                    line.push_str(&format!(
+                        "\n  {}\t{}% remaining\t{} min",
+                        window.id, window.remaining_percent, window.window_duration_mins
+                    ));
+                    if let Some(resets_at) = window.resets_at {
+                        line.push_str(&format!("\tresets {resets_at}"));
+                    }
+                }
             }
             line
         }
