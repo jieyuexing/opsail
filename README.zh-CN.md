@@ -63,6 +63,7 @@ opsail refit codex enable usage --launch
 | 包 | 职责 | 文档 |
 | --- | --- | --- |
 | [`opsail`](https://crates.io/crates/opsail) | 原生 CLI 与统一命令入口 | 运行 `opsail --help` |
+| `opsail-gateway` | 加密连接、HTTP 调用与模型协议 | [README](https://github.com/lencx/opsail/blob/main/crates/opsail-gateway/README.md) |
 | [`opsail-read`](https://crates.io/crates/opsail-read) | 内容获取、正文提取、清理和结果契约 | [README](https://github.com/lencx/opsail/blob/main/crates/opsail-read/README.md) |
 | [`opsail-chrome`](https://crates.io/crates/opsail-chrome) | 跨平台 Chrome 生命周期、CDP 传输和渲染捕获 | [README](https://github.com/lencx/opsail/blob/main/crates/opsail-chrome/README.md) |
 | [`opsail-usage`](https://crates.io/crates/opsail-usage) | CLI provider 剩余额度查询 | [README](https://github.com/lencx/opsail/blob/main/crates/opsail-usage/README.md) |

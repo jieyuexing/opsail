@@ -412,17 +412,69 @@ export interface OpsailConfig {
 }
 
 export interface OpsailClient {
+  gateway(request: GatewayRequest, options: GatewayCallOptions): Promise<GatewayResult>;
   read(request: ReadRequest, options?: CallOptions): Promise<ReadArtifact>;
   usage(request?: UsageRequest, options?: CallOptions): Promise<UsageResult>;
 }
 
 export class OpsailError extends Error {
   readonly code: string;
-  readonly stage: "input" | "acquire" | "extract" | "protocol" | "process";
+  readonly stage: "input" | "vault" | "acquire" | "extract" | "protocol" | "process";
   readonly retryable: boolean;
   readonly recovery?: string;
   readonly diagnostic?: string;
+  readonly httpStatus?: number;
+  readonly providerCode?: string;
+  readonly elapsedMs?: number;
 }
+
+export type GatewayAuth = { type: "none" } | { type: "bearer"; key: string }
+  | { type: "header"; name: string; key: string };
+export interface GatewayConnection {
+  name: string;
+  adapter: "http" | "openai-compatible" | "vercel-ai-gateway";
+  baseUrl: string;
+  auth: GatewayAuth;
+  defaultModel?: string;
+  allowHttp?: boolean;
+}
+export interface GatewayConnectionSummary extends Omit<GatewayConnection, "auth"> {
+  authType: "none" | "bearer" | "header";
+  authHeader?: string;
+  hasKey: boolean;
+}
+export type EvaluationInput = string | Record<string, unknown> | unknown[];
+export type EvaluationQuestion =
+  | { type: "boolean"; instructions: EvaluationInput; criteria?: { true?: EvaluationInput | null; false?: EvaluationInput | null } }
+  | { type: "choice"; instructions: EvaluationInput; criteria: Record<string, EvaluationInput | null> }
+  | { type: "score"; instructions: EvaluationInput; criteria: (EvaluationInput | null)[] };
+export type GatewayRequest =
+  | { operation: "init" | "list" | "rekey" }
+  | { operation: "set"; connection: GatewayConnection }
+  | { operation: "remove"; name: string }
+  | { operation: "request"; connection: string; method: string; path: string; query?: Record<string, string>;
+      headers?: Record<string, string>; body?: { type: "json"; value: unknown } | { type: "text"; value: string }; timeoutMs?: number }
+  | { operation: "models"; connection: string; timeoutMs?: number }
+  | { operation: "chat"; connection: string; model?: string; messages: Record<string, unknown>[];
+      parameters?: Record<string, unknown>; timeoutMs?: number }
+  | { operation: "evaluate"; connection: string; model?: string; state: EvaluationInput;
+      questions: Record<string, EvaluationQuestion>; providerOptions?: unknown; timeoutMs?: number };
+export interface GatewayCallOptions extends CallOptions {
+  /** Passed only through private child stdin, never argv or a persisted configuration. */
+  passphrase: string;
+  newPassphrase?: string;
+  dataDir?: string;
+}
+export interface GatewayResult {
+  schemaVersion: 1;
+  operation: GatewayRequest["operation"];
+  connection?: string;
+  httpStatus?: number;
+  elapsedMs: number;
+  /** Full provider JSON/text or a credential-free management result. */
+  data: unknown;
+}
+export function gateway(request: GatewayRequest, options: GatewayCallOptions): Promise<GatewayResult>;
 
 export function read(
   request: ReadRequest,

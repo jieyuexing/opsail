@@ -63,6 +63,7 @@ See [`opsail-refit-codex`](https://github.com/lencx/opsail/blob/main/crates/opsa
 | Package | Responsibility | Documentation |
 | --- | --- | --- |
 | [`opsail`](https://crates.io/crates/opsail) | Native CLI and unified command entry point | Run `opsail --help` |
+| `opsail-gateway` | Encrypted connections and HTTP/model protocols | [README](https://github.com/lencx/opsail/blob/main/crates/opsail-gateway/README.md) |
 | [`opsail-read`](https://crates.io/crates/opsail-read) | Content acquisition, extraction, sanitization, and result contracts | [README](https://github.com/lencx/opsail/blob/main/crates/opsail-read/README.md) |
 | [`opsail-chrome`](https://crates.io/crates/opsail-chrome) | Cross-platform Chrome lifecycle, CDP transport, and rendered capture | [README](https://github.com/lencx/opsail/blob/main/crates/opsail-chrome/README.md) |
 | [`opsail-usage`](https://crates.io/crates/opsail-usage) | Remaining-usage queries for supported CLI providers | [README](https://github.com/lencx/opsail/blob/main/crates/opsail-usage/README.md) |

@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/opsail",
+    "crates/opsail-gateway",
     "crates/opsail-chrome",
     "crates/opsail-read",
     "crates/opsail-xlsx",
@@ -18,6 +19,11 @@ readme = "README.md"
 repository = "https://github.com/lencx/opsail"
 
 [workspace.dependencies]
+age = "0.12.1"
+directories = "6.0.0"
+fs2 = "0.4.3"
+rpassword = "7.5.4"
+zeroize = { version = "1.8.2", features = ["derive"] }
 ammonia = "4.1.3"
 assert_cmd = "2.2.2"
 clap = { version = "4.6.1", features = ["derive"] }

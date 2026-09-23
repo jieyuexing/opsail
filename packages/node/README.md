@@ -216,3 +216,34 @@ For an `html` source, `baseUrl` is the resolution base for relative links in the
 captured document, while `finalUrl` is the browser's final navigation URL and is
 reported as `source.resolvedUrl`. When `baseUrl` is omitted, `finalUrl` also
 serves as the link-resolution base.
+
+## Gateway
+
+```js
+import { createOpsail } from 'opsail';
+
+const client = createOpsail();
+// Obtain passphrase from the caller's private input, never a saved source file.
+const result = await client.gateway({
+  operation: 'chat',
+  connection: 'local',
+  messages: [{ role: 'user', content: 'Say hello' }],
+  parameters: { max_tokens: 64 },
+}, { passphrase });
+console.log(result.data);
+```
+
+`gateway` is also exported as a top-level function. It starts `opsail gateway
+--machine` and sends the versioned request, `passphrase`, optional `newPassphrase`
+and `dataDir` on private stdin. `signal` cancels the owned process. Gateway uses
+a 60-second default process deadline, extended for a larger native `timeoutMs`;
+`createOpsail({ hardTimeoutMs })` is an explicit override. Errors use `OpsailError`,
+including optional `httpStatus`, `providerCode`, and `elapsedMs`. Private gateway
+stderr and malformed output are not attached to errors. Node strings are not
+zeroizable; callers should keep passphrases short-lived and avoid logging inputs.
+
+Connections and Rust/CLI contracts are in the
+[Gateway guide](../../crates/opsail-gateway/README.md). The existing `read` API is
+unchanged. Gateway results contain the complete JSON/text provider response in
+`data`, rather than reducing it to an assistant text string. No tool execution,
+streaming, automatic retries, or background model service is provided.

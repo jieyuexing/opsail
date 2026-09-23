@@ -13,6 +13,7 @@
 
 ```text
 crates/opsail          原生 CLI 解析、协议路由、诊断和退出行为
+crates/opsail-gateway Encrypted connections, bounded HTTP calls, and model protocols
 crates/opsail-chrome   Chrome 可执行文件查找、自有生命周期、CDP 与 DOM 捕获
 crates/opsail-read     来源编排、HTML 获取、正文提取、清洗和结果 schema
 crates/opsail-refit-codex Codex refit 生命周期、目标安全校验与 renderer 集成

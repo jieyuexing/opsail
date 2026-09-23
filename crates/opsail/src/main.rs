@@ -17,6 +17,7 @@ use url::Url;
 
 mod activity;
 mod codex;
+mod gateway;
 mod machine;
 mod usage;
 mod view;
@@ -44,6 +45,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Manage encrypted connections and call HTTP APIs or models.
+    Gateway(gateway::GatewayArgs),
     /// Read a URL, HTML input, or XLSX workbook.
     #[command(visible_alias = "extract")]
     Read(Box<ReadArgs>),
@@ -277,6 +280,7 @@ async fn async_main() -> ExitCode {
 
 async fn execute(command: Command) -> ExitCode {
     match command {
+        Command::Gateway(args) => gateway::run(args).await,
         Command::Read(args) if args.machine => machine::run().await,
         Command::Xlsx(args) => xlsx::run(args).await,
         command => match run(command).await {
@@ -386,6 +390,7 @@ fn load_cookie_file(path: &Path) -> Result<CookieSource> {
 
 async fn run(command: Command) -> Result<()> {
     match command {
+        Command::Gateway(_) => unreachable!("gateway handled by execute"),
         Command::Read(args) => run_read(*args).await,
         Command::Usage(args) => usage::run(args).await,
         Command::Refit(args) => run_refit(args).await,

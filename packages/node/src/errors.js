@@ -9,6 +9,9 @@ export class OpsailError extends Error {
     this.code = options.code ?? "unknown";
     this.stage = options.stage ?? "process";
     this.retryable = options.retryable ?? false;
+    for (const field of ["httpStatus", "providerCode", "elapsedMs"]) {
+      if (options[field] !== undefined) this[field] = options[field];
+    }
     if (options.recovery !== undefined) {
       this.recovery = options.recovery;
     }
