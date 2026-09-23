@@ -55,10 +55,21 @@ omitted when unused. The library never returns raw RPC frames or auth material.
 
 Claude adds an optional `windows` array without changing schema version 1.
 Each window has `id`, `remainingPercent`, `usedPercent`, `windowDurationMins`
-and optional `resetsAt` (Unix seconds). `five_hour` is 300 minutes; `seven_day`
-and `seven_day_*` are 10080 minutes. Null windows are omitted. Percentages use
+and optional `resetsAt` (Unix seconds) and `label` (the readable model name).
+`five_hour` is 300 minutes; `seven_day` and `seven_day_*` are 10080 minutes. Percentages use
 the endpoint's 0–100 units, not fractions. RFC3339 reset offsets are respected.
 Paid extra usage is not a subscription window and is not projected.
+
+Claude prefers the endpoint's nonempty `limits` array: `session` maps to
+`five_hour`, `weekly_all` to `seven_day`, and `weekly_scoped` with a model
+display name to `seven_day_<model>`. Model IDs use lowercase ASCII letters
+and digits, replacing each other character with an underscore; `label`
+preserves the display name. Unknown kinds and scopes without model names
+are ignored. `percent` is the used percentage; `is_active` does not filter windows.
+When `limits` is absent or empty, only the legacy `five_hour`, `seven_day`
+and named `seven_day_*` objects with numeric `utilization` become windows.
+Missing/null utilization (including `seven_day_breakdown`) is skipped;
+other nonnumeric utilization is rejected. Unrelated code-name keys are ignored.
 
 The existing top-level fields mirror `five_hour`, falling back to `seven_day`
 and then the first named weekly window when preceding windows are absent.

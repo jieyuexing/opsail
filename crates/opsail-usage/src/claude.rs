@@ -260,49 +260,19 @@ async fn query_usage(
 fn parse_usage(bytes: &[u8], plan_type: Option<String>) -> Result<UsageEntry, &'static str> {
     let root: Value = serde_json::from_slice(bytes).map_err(|_| INVALID_RESPONSE)?;
     let object = root.as_object().ok_or(INVALID_RESPONSE)?;
-    let mut windows = Vec::new();
-    for (id, value) in object {
-        let duration = if id == "five_hour" {
-            300.0
-        } else if id == "seven_day"
-            || (id.starts_with("seven_day_")
-                && id.len() <= 64
-                && id
-                    .bytes()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_'))
-        {
-            10_080.0
-        } else {
-            continue;
-        };
-        if value.is_null() {
-            continue;
-        }
-        let used = value
-            .get("utilization")
-            .and_then(Value::as_f64)
-            .filter(|number| number.is_finite())
-            .ok_or(INVALID_RESPONSE)?
-            .clamp(0.0, 100.0);
-        let resets_at = match value.get("resets_at") {
-            None | Some(Value::Null) => None,
-            Some(value) => {
-                let time = OffsetDateTime::parse(value.as_str().ok_or(INVALID_RESPONSE)?, &Rfc3339)
-                    .map_err(|_| INVALID_RESPONSE)?;
-                Some(u64::try_from(time.unix_timestamp()).map_err(|_| INVALID_RESPONSE)?)
-            }
-        };
-        windows.push(UsageWindow {
-            id: id.clone(),
-            remaining_percent: (100.0 - used).round() as u8,
-            used_percent: used,
-            resets_at,
-            window_duration_mins: duration,
-        });
-    }
-    // Preserve a deterministic primary projection; weekly/model windows remain separately visible.
+    let mut windows = match object.get("limits") {
+        Some(Value::Array(limits)) if !limits.is_empty() => parse_limits(limits)?,
+        None | Some(Value::Array(_)) => parse_legacy_windows(object)?,
+        Some(_) => return Err(INVALID_RESPONSE),
+    };
+    // Keep stable ordering and the legacy model-only fallback, independent of limits order.
     windows.sort_by(|a, b| a.id.cmp(&b.id));
-    let primary = windows.first().ok_or(INVALID_RESPONSE)?;
+    let primary = windows
+        .iter()
+        .find(|window| window.id == "five_hour")
+        .or_else(|| windows.iter().find(|window| window.id == "seven_day"))
+        .or_else(|| windows.first())
+        .ok_or(INVALID_RESPONSE)?;
     Ok(UsageEntry {
         provider: UsageProvider::Claude,
         status: UsageStatus::Ready,
@@ -315,6 +285,105 @@ fn parse_usage(bytes: &[u8], plan_type: Option<String>) -> Result<UsageEntry, &'
         reset_credit_expires_at: None,
         detail: None,
         windows: Some(windows),
+    })
+}
+
+fn parse_limits(limits: &[Value]) -> Result<Vec<UsageWindow>, &'static str> {
+    let mut windows = Vec::new();
+    for limit in limits {
+        let (id, label, duration) = match limit.get("kind").and_then(Value::as_str) {
+            Some("session") => ("five_hour".to_owned(), None, 300.0),
+            Some("weekly_all") => ("seven_day".to_owned(), None, 10_080.0),
+            Some("weekly_scoped") => {
+                let Some(label) = limit
+                    .pointer("/scope/model/display_name")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.trim().is_empty())
+                else {
+                    continue;
+                };
+                let model: String = label
+                    .chars()
+                    .map(|c| {
+                        if c.is_ascii_alphanumeric() {
+                            c.to_ascii_lowercase()
+                        } else {
+                            '_'
+                        }
+                    })
+                    .collect();
+                (
+                    format!("seven_day_{model}"),
+                    Some(label.to_owned()),
+                    10_080.0,
+                )
+            }
+            _ => continue,
+        };
+        let used = limit
+            .get("percent")
+            .and_then(Value::as_f64)
+            .ok_or(INVALID_RESPONSE)?;
+        windows.push(parse_window(id, label, duration, used, limit)?);
+    }
+    Ok(windows)
+}
+
+fn parse_legacy_windows(
+    object: &serde_json::Map<String, Value>,
+) -> Result<Vec<UsageWindow>, &'static str> {
+    let mut windows = Vec::new();
+    for (id, value) in object {
+        let duration = if id == "five_hour" {
+            300.0
+        } else if id == "seven_day"
+            || (id.starts_with("seven_day_")
+                && id.len() > "seven_day_".len()
+                && id.len() <= 64
+                && id
+                    .bytes()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_'))
+        {
+            10_080.0
+        } else {
+            continue;
+        };
+        // Metadata such as seven_day_breakdown is not a quota window.
+        let used = match value.get("utilization") {
+            None | Some(Value::Null) => continue,
+            Some(value) => value.as_f64().ok_or(INVALID_RESPONSE)?,
+        };
+        windows.push(parse_window(id.clone(), None, duration, used, value)?);
+    }
+    Ok(windows)
+}
+
+fn parse_window(
+    id: String,
+    label: Option<String>,
+    duration: f64,
+    used: f64,
+    value: &Value,
+) -> Result<UsageWindow, &'static str> {
+    if !used.is_finite() {
+        return Err(INVALID_RESPONSE);
+    }
+    let used = used.clamp(0.0, 100.0);
+    let resets_at = match value.get("resets_at") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let time = OffsetDateTime::parse(value.as_str().ok_or(INVALID_RESPONSE)?, &Rfc3339)
+                .map_err(|_| INVALID_RESPONSE)?;
+            Some(u64::try_from(time.unix_timestamp()).map_err(|_| INVALID_RESPONSE)?)
+        }
+    };
+    Ok(UsageWindow {
+        id,
+        label,
+        remaining_percent: (100.0 - used).round() as u8,
+        used_percent: used,
+        resets_at,
+        window_duration_mins: duration,
     })
 }
 
@@ -348,6 +417,142 @@ mod tests {
         })
     }
 
+    fn structured_payload() -> Value {
+        // Credential-free shape captured from the official endpoint; values are examples.
+        json!({
+            "five_hour": {"utilization": 9.0, "resets_at": "2026-09-24T02:30:00.390086+00:00", "limit_dollars": null, "used_dollars": null, "remaining_dollars": null, "locked_reason": null},
+            "seven_day": {"utilization": 32.0, "resets_at": "2026-09-24T11:00:00.390107+00:00", "limit_dollars": null, "used_dollars": null, "remaining_dollars": null, "locked_reason": null},
+            "seven_day_oauth_apps": null,
+            "seven_day_opus": null,
+            "seven_day_sonnet": null,
+            "seven_day_cowork": null,
+            "seven_day_omelette": null,
+            "tangelo": null,
+            "nimbus_quill": {"utilization": 0.0, "resets_at": null, "limit_dollars": null, "used_dollars": null, "remaining_dollars": null, "locked_reason": null},
+            "extra_usage": {"is_enabled": false, "monthly_limit": null, "used_credits": null, "utilization": null, "currency": null, "decimal_places": null, "disabled_reason": null, "user_disabled": false, "spend_limit_reached": false, "credits_ever_enabled": false, "daily": null, "weekly": null},
+            "limits": [
+                {"kind": "session", "group": "session", "percent": 9, "severity": "normal", "resets_at": "2026-09-24T02:30:00.390086+00:00", "scope": null, "is_active": false},
+                {"kind": "weekly_all", "group": "weekly", "percent": 32, "severity": "normal", "resets_at": "2026-09-24T11:00:00.390107+00:00", "scope": null, "is_active": true},
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 29, "severity": "normal", "resets_at": "2026-09-24T11:00:00.390276+00:00", "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}, "is_active": false}
+            ],
+            "spend": {"used": {"amount_minor": 0, "currency": "USD", "exponent": 2}, "limit": null, "percent": 0, "severity": "normal", "enabled": false, "disabled_reason": null, "cap": null, "balance": null, "auto_reload": null, "disclaimer": "…", "can_purchase_credits": false, "can_toggle": false},
+            "member_dashboard_available": false,
+            "seven_day_breakdown": {"as_of": "2026-09-24T01:00:00.000000+00:00", "window_started_at": "2026-09-17T11:00:00.000000+00:00", "rows": [{"key": "claude_code", "display_name": "Claude Code", "percent": 100}]}
+        })
+    }
+
+    #[test]
+    fn structured_limits_keep_three_windows_labels_and_microsecond_resets() {
+        let entry = parse_usage(&serde_json::to_vec(&structured_payload()).unwrap(), None).unwrap();
+        assert_eq!(entry.status, UsageStatus::Ready);
+        assert_eq!(entry.remaining_percent, Some(91));
+        assert_eq!(entry.used_percent, Some(9.0));
+        assert_eq!(entry.resets_at, Some(1_790_217_000));
+        assert_eq!(entry.window_duration_mins, Some(300.0));
+        let report = crate::UsageReport {
+            schema_version: crate::SCHEMA_VERSION,
+            providers: vec![entry],
+        };
+        let output = serde_json::to_value(report).unwrap();
+        assert_eq!(output["schemaVersion"], 1);
+        assert_eq!(
+            output["providers"][0]["windows"],
+            json!([
+                {"id": "five_hour", "remainingPercent": 91, "usedPercent": 9.0, "resetsAt": 1_790_217_000, "windowDurationMins": 300.0},
+                {"id": "seven_day", "remainingPercent": 68, "usedPercent": 32.0, "resetsAt": 1_790_247_600, "windowDurationMins": 10_080.0},
+                {"id": "seven_day_fable", "label": "Fable", "remainingPercent": 71, "usedPercent": 29.0, "resetsAt": 1_790_247_600, "windowDurationMins": 10_080.0}
+            ])
+        );
+    }
+
+    #[test]
+    fn structured_limits_override_legacy_values_and_order_does_not_choose_primary() {
+        let mut value = structured_payload();
+        value["five_hour"]["utilization"] = json!("invalid-legacy-value");
+        value["seven_day"]["utilization"] = json!(99);
+        value["limits"].as_array_mut().unwrap().reverse();
+        let entry = parse_usage(&serde_json::to_vec(&value).unwrap(), None).unwrap();
+        assert_eq!(entry.used_percent, Some(9.0));
+        assert_eq!(entry.windows.unwrap()[1].used_percent, 32.0);
+
+        value["limits"].as_array_mut().unwrap().pop(); // Remove session, keep weekly windows.
+        let entry = parse_usage(&serde_json::to_vec(&value).unwrap(), None).unwrap();
+        assert_eq!(entry.used_percent, Some(32.0));
+        assert_eq!(entry.remaining_percent, Some(68));
+        assert_eq!(entry.resets_at, Some(1_790_247_600));
+        assert_eq!(entry.window_duration_mins, Some(10_080.0));
+    }
+
+    #[test]
+    fn unknown_kinds_and_scopes_without_a_model_name_are_ignored() {
+        let mut value = structured_payload();
+        let limits = value["limits"].as_array_mut().unwrap();
+        limits.push(json!({"kind": "future_limit", "percent": "invalid", "resets_at": "invalid"}));
+        for scope in [
+            Value::Null,
+            json!({"surface": "cli"}),
+            json!({"model": {"display_name": ""}}),
+        ] {
+            limits.push(json!({"kind": "weekly_scoped", "scope": scope}));
+        }
+        let entry = parse_usage(&serde_json::to_vec(&value).unwrap(), None).unwrap();
+        assert_eq!(entry.windows.unwrap().len(), 3);
+    }
+
+    #[test]
+    fn model_ids_are_normalized_and_offset_resets_preserve_the_instant() {
+        let mut value = structured_payload();
+        value["limits"][2]["scope"]["model"]["display_name"] = json!("Fable 5.5/Pro");
+        value["limits"][2]["resets_at"] = json!("2026-09-24T19:00:00.390276+08:00");
+        let entry = parse_usage(&serde_json::to_vec(&value).unwrap(), None).unwrap();
+        let windows = entry.windows.unwrap();
+        assert_eq!(windows[2].id, "seven_day_fable_5_5_pro");
+        assert_eq!(windows[2].label.as_deref(), Some("Fable 5.5/Pro"));
+        assert_eq!(windows[2].resets_at, Some(1_790_247_600));
+    }
+
+    #[test]
+    fn legacy_fallback_skips_breakdown_null_utilization_and_unrecognized_keys() {
+        let mut value = structured_payload();
+        value.as_object_mut().unwrap().remove("limits");
+        value["seven_day_sonnet"] = json!({"utilization": null, "resets_at": "invalid"});
+        value["seven_day_fable"] = json!({"utilization": 29});
+        value["seven_day_"] = json!({"utilization": 99});
+        value["seven_day_breakdown"]["resets_at"] = json!("invalid");
+        for empty_limits in [false, true] {
+            if empty_limits {
+                value["limits"] = json!([]);
+            }
+            let entry = parse_usage(&serde_json::to_vec(&value).unwrap(), None).unwrap();
+            assert_eq!(entry.used_percent, Some(9.0));
+            let windows = entry.windows.unwrap();
+            assert_eq!(
+                windows.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(),
+                ["five_hour", "seven_day", "seven_day_fable"]
+            );
+            assert!(windows.iter().all(|w| w.label.is_none()));
+        }
+    }
+
+    #[test]
+    fn malformed_structured_limits_do_not_fall_back_to_legacy_windows() {
+        for limits in [
+            Value::Null,
+            json!({}),
+            json!([{"kind": "future_limit"}]),
+            json!([{"kind": "session", "percent": null}]),
+            json!([{"kind": "session", "percent": "9"}]),
+            json!([{"kind": "session", "percent": 9, "resets_at": "invalid"}]),
+        ] {
+            let mut value = structured_payload();
+            value["limits"] = limits;
+            assert_eq!(
+                parse_usage(&serde_json::to_vec(&value).unwrap(), None).unwrap_err(),
+                INVALID_RESPONSE
+            );
+        }
+    }
+
     #[test]
     fn parses_all_windows_and_keeps_primary_fields_in_schema_one() {
         let entry =
@@ -369,6 +574,7 @@ mod tests {
         assert_eq!(windows[1].window_duration_mins, 10_080.0);
         assert_eq!(windows[1].resets_at, windows[2].resets_at);
         assert_eq!(windows[3].resets_at, None);
+        assert!(windows.iter().all(|window| window.label.is_none()));
         let report = crate::UsageReport {
             schema_version: 1,
             providers: vec![entry],
@@ -406,7 +612,10 @@ mod tests {
             r#"{"five_hour":{"utilization":1,"resets_at":"2026-02-30T00:00:00Z"}}"#,
             r#"{"five_hour":{"utilization":1,"resets_at":"2026-09-24T25:00:00Z"}}"#,
             r#"{"five_hour":{"utilization":1,"resets_at":"1960-01-01T00:00:00Z"}}"#,
-            r#"{"five_hour":{"utilization":1},"seven_day":{"utilization":null}}"#,
+            r#"{"five_hour":{"utilization":null}}"#,
+            r#"{"five_hour":{"utilization":1},"seven_day":{"utilization":"32"}}"#,
+            r#"{"five_hour":{"utilization":true}}"#,
+            r#"{"five_hour":{"utilization":[]}}"#,
         ] {
             assert_eq!(
                 parse_usage(payload.as_bytes(), None).unwrap_err(),
@@ -540,6 +749,19 @@ mod tests {
         assert_eq!(report.schema_version, 1);
         assert_eq!(report.providers[0].status, UsageStatus::Ready);
         assert_eq!(report.providers[0].windows.as_ref().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn authenticated_get_accepts_structured_limits_with_breakdown_metadata() {
+        let report =
+            query_fixture(ResponseTemplate::new(200).set_body_json(structured_payload())).await;
+        assert_eq!(report.schema_version, 1);
+        let entry = &report.providers[0];
+        assert_eq!(entry.status, UsageStatus::Ready);
+        assert_eq!(entry.remaining_percent, Some(91));
+        let windows = entry.windows.as_ref().unwrap();
+        assert_eq!(windows.len(), 3);
+        assert_eq!(windows[2].label.as_deref(), Some("Fable"));
     }
 
     #[tokio::test]

@@ -129,6 +129,9 @@ pub struct UsageSnapshot {
 #[serde(rename_all = "camelCase")]
 pub struct UsageWindow {
     pub id: String,
+    /// Human-readable model name, when supplied by a structured scoped limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     pub remaining_percent: u8,
     pub used_percent: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
