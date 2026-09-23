@@ -21,7 +21,9 @@ Each character displays `*`; Backspace edits, Ctrl-U clears, and Ctrl-C cancels.
 Prompts and masking stay off stdout. Initialization confirms the passphrase;
 `rekey` asks for the current password and confirms its replacement. No password
 or API key flag is accepted. `connection set` replaces the complete named
-connection, including its key. `connection remove NAME` deletes one connection.
+connection, including its key. `connection model NAME [MODEL]` changes only the
+default model and keeps the stored key; omit MODEL to clear it. `connection remove
+NAME` deletes one connection.
 
 By default, `vault.age` lives in the OS user's configuration directory under
 `opsail/gateway`: Application Support on macOS, XDG_CONFIG_HOME (or ~/.config)
@@ -124,7 +126,7 @@ change requires a deliberate adapter and fixture update.
 
 Never save real versions of this example to disk or shell history. `newPassphrase`
 is supplied only for `rekey`; otherwise omit it. Supported operations are init,
-list, set (connection object), remove (name), rekey, request, models, chat and
+list, set (connection object), set-default-model (name, optional model), remove (name), rekey, request, models, chat and
 evaluate. Success is `{protocolVersion:1,ok:true,engine,result}` and exit 0;
 failure is `{protocolVersion:1,ok:false,engine,error}` and exit 1. Result contains
 schemaVersion, operation, data, elapsedMs, and optional connection/httpStatus.

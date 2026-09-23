@@ -139,6 +139,11 @@ pub enum GatewayRequest {
     Remove {
         name: String,
     },
+    SetDefaultModel {
+        name: String,
+        #[serde(default)]
+        model: Option<String>,
+    },
     Rekey,
     Request {
         connection: String,
@@ -188,6 +193,7 @@ impl GatewayRequest {
             Self::List => "list",
             Self::Set { .. } => "set",
             Self::Remove { .. } => "remove",
+            Self::SetDefaultModel { .. } => "set-default-model",
             Self::Rekey => "rekey",
             Self::Request { .. } => "request",
             Self::Models { .. } => "models",

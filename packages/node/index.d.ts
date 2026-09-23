@@ -452,6 +452,7 @@ export type GatewayRequest =
   | { operation: "init" | "list" | "rekey" }
   | { operation: "set"; connection: GatewayConnection }
   | { operation: "remove"; name: string }
+  | { operation: "set-default-model"; name: string; model?: string | null }
   | { operation: "request"; connection: string; method: string; path: string; query?: Record<string, string>;
       headers?: Record<string, string>; body?: { type: "json"; value: unknown } | { type: "text"; value: string }; timeoutMs?: number }
   | { operation: "models"; connection: string; timeoutMs?: number }
