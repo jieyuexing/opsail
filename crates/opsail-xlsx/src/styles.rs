@@ -405,6 +405,86 @@ pub fn run_properties(
     }
     Ok(properties)
 }
+/// CT_RPrElt child names in schema order.
+const RUN_PROPERTIES: [&str; 15] = [
+    "rFont",
+    "charset",
+    "family",
+    "b",
+    "i",
+    "strike",
+    "outline",
+    "shadow",
+    "condense",
+    "extend",
+    "color",
+    "sz",
+    "u",
+    "vertAlign",
+    "scheme",
+];
+/// Apply appendText overrides to a copy of an existing run's rPr. Existing
+/// children keep their stored order; a missing override is inserted before the
+/// first child that follows it in CT_RPrElt order.
+pub fn override_run_properties(
+    properties: &Element,
+    parent: &Element,
+    overrides: &Style,
+) -> Result<Element> {
+    if properties
+        .elements()
+        .any(|e| !RUN_PROPERTIES.contains(&e.local_name()))
+    {
+        return Err(invalid(
+            "unsupported run properties require native application",
+        ));
+    }
+    let mut result = properties.clone();
+    let flag = |value: Option<bool>| {
+        value.map(|v| {
+            let mut e = Element::new("");
+            e.attrs
+                .insert("val".into(), if v { "1" } else { "0" }.into());
+            e
+        })
+    };
+    let color = overrides
+        .font_color
+        .as_deref()
+        .map(|c| {
+            rgb(c).map(|rgb| {
+                let mut e = Element::new("");
+                e.attrs.insert("rgb".into(), rgb);
+                e
+            })
+        })
+        .transpose()?;
+    for (name, replacement) in [
+        ("b", flag(overrides.bold)),
+        ("strike", flag(overrides.strike)),
+        ("color", color),
+    ] {
+        let Some(mut replacement) = replacement else {
+            continue;
+        };
+        replacement.name = make(parent, name).name;
+        let at = result.children.iter().position(|n| named(n, &[name]));
+        result.children.retain(|n| !named(n, &[name]));
+        let later = &RUN_PROPERTIES[RUN_PROPERTIES.iter().position(|n| *n == name).unwrap() + 1..];
+        let at = at.unwrap_or_else(|| {
+            result
+                .children
+                .iter()
+                .position(|n| named(n, later))
+                .unwrap_or(result.children.len())
+        });
+        result.children.insert(at, Node::Element(replacement));
+    }
+    Ok(result)
+}
+fn named(n: &Node, names: &[&str]) -> bool {
+    matches!(n, Node::Element(e) if names.contains(&e.local_name()))
+}
 fn boolean(e: Option<&Element>, attr: &str, default: bool) -> bool {
     e.map_or(default, |e| {
         e.attrs.get(attr).is_none_or(|v| v != "0" && v != "false")

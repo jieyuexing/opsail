@@ -79,7 +79,8 @@ fn machine(request: Value, success: bool) -> Value {
                 "validateOnly",
                 "compactInspect",
                 "setFormula",
-                "insertRows"
+                "insertRows",
+                "appendRichText"
             ])
         );
     }
@@ -306,18 +307,40 @@ fn machine_append_text_preserves_stored_font_and_shared_string_neighbour() {
         read_part(&source, "xl/sharedStrings.xml"),
         read_part(&output, "xl/sharedStrings.xml")
     );
-    let rejected = machine(
+    // A second append keeps both existing runs and inherits the last run font.
+    let again = dir.path().join("again.xlsx");
+    machine(
         patch_request(
             &output,
+            &again,
+            json!([
+                {"op":"appendText","sheet":"UseCase","cell":"A1","expectedText":"hello world <&>","value":" again","strike":false}
+            ]),
+        ),
+        true,
+    );
+    let inspected = inspect_machine(&again, "UseCase!A1", "compact");
+    assert_eq!(inspected["cells"][0]["text"], "hello world <&> again");
+    let sheet = read_part(&again, "xl/worksheets/sheet1.xml");
+    assert_eq!(sheet.matches("<rPr>").count(), 4);
+    assert_eq!(sheet.matches(r#"<color rgb="FF123456"/>"#).count(), 2);
+    assert!(sheet.contains(r#"<strike val="0"/>"#));
+    assert_eq!(
+        read_part(&output, "xl/sharedStrings.xml"),
+        read_part(&again, "xl/sharedStrings.xml")
+    );
+    let rejected = machine(
+        patch_request(
+            &again,
             &dir.path().join("rejected.xlsx"),
             json!([
-                {"op":"appendText","sheet":"UseCase","cell":"A1","expectedText":"hello world <&>","value":"again"}
+                {"op":"setText","sheet":"UseCase","cell":"A1","expectedText":"hello world <&> again","value":"replace"}
             ]),
         ),
         false,
     );
     assert_eq!(rejected["error"]["operationIndex"], 0);
-    assert_eq!(rejected["error"]["op"], "appendText");
+    assert_eq!(rejected["error"]["op"], "setText");
     assert!(
         rejected["error"]["message"]
             .as_str()

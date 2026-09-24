@@ -406,7 +406,8 @@ fn envelope(operation: &str, mut v: Value) -> Result<Value> {
         "validateOnly",
         "compactInspect",
         "setFormula",
-        "insertRows"
+        "insertRows",
+        "appendRichText"
     ]);
     v["visualVerification"] = json!("pending");
     v["proofBoundary"] = json!(

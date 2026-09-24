@@ -338,12 +338,76 @@ fn append_text_copies_font_into_ordered_runs_and_overrides_only_new_run() {
 }
 
 #[test]
+fn append_text_keeps_inline_rich_runs_and_inherits_last_run_font() {
+    let fixture = Fixture::new(
+        r#"<sheetData><row r="1"><c r="A1" s="1" t="inlineStr"><is><r><rPr><b/><color rgb="FF00FF00"/></rPr><t>green</t></r><r><rPr><strike/><color theme="1"/><sz val="9"/></rPr><t xml:space="preserve"> struck</t></r></is></c><c r="B1" t="inlineStr"><is><t>lead</t><r><rPr><i/></rPr><t> tail</t></r></is></c></row></sheetData>"#,
+    );
+    let mut book = fixture.book();
+    let before = |book: &Book, reference: &str| {
+        cell(book, reference)
+            .child("is")
+            .unwrap()
+            .elements()
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let (a1, b1) = (before(&book, "A1"), before(&book, "B1"));
+    let mismatch = operation(
+        json!({"op":"appendText","sheet":"UseCase","cell":"A1","expectedText":"green","value":"x"}),
+    );
+    assert!(
+        book.apply_bounded(&mismatch, 1, true)
+            .unwrap_err()
+            .to_string()
+            .contains("expectedText")
+    );
+    apply(
+        &mut book,
+        json!({"op":"appendText","sheet":"UseCase","cell":"A1","expectedText":"green struck","value":" new","strike":false}),
+    );
+    apply(
+        &mut book,
+        json!({"op":"appendText","sheet":"UseCase","cell":"B1","expectedText":"lead tail","value":"!","fontColor":"123456"}),
+    );
+    let runs = before(&book, "A1");
+    assert_eq!(runs.len(), 3);
+    assert_eq!(runs[..2], a1[..]);
+    let p = runs[2].child("rPr").unwrap();
+    // The last run's font is copied in stored order; only strike changes.
+    assert_eq!(
+        p.elements().map(Element::local_name).collect::<Vec<_>>(),
+        ["strike", "color", "sz"]
+    );
+    assert_eq!(p.child("strike").unwrap().attrs["val"], "0");
+    assert_eq!(p.child("color").unwrap().attrs["theme"], "1");
+    assert_eq!(runs[2].child("t").unwrap().text(), " new");
+    assert_eq!(cell(&book, "A1").attrs["s"], "1");
+    let runs = before(&book, "B1");
+    assert_eq!(runs[..2], b1[..]);
+    let p = runs[2].child("rPr").unwrap();
+    assert_eq!(
+        p.elements().map(Element::local_name).collect::<Vec<_>>(),
+        ["i", "color"]
+    );
+    assert_eq!(p.child("color").unwrap().attrs["rgb"], "FF123456");
+    assert_eq!(compact(&book, "A1")["text"], "green struck new");
+    assert_eq!(compact(&book, "B1")["text"], "lead tail!");
+    assert_eq!(
+        book.updates(&fixture.package)
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        ["xl/worksheets/sheet1.xml"]
+    );
+}
+
+#[test]
 fn new_text_operations_preserve_existing_safety_refusals() {
     let fixture = Fixture::new(
         r#"<sheetData><row r="1"><c r="A1"><f>1+1</f><v>2</v></c><c r="B1" t="s"><v>1</v></c><c r="C1" t="inlineStr"><is><r><t>rich</t></r></is></c><c r="D1" t="inlineStr"><is><t>_x000A_</t></is></c><c r="E1" t="b"><v>1</v></c><c r="F1" s="2"/></row></sheetData>"#,
     );
     let mut book = fixture.book();
-    for op in ["setNumber", "appendText"] {
+    for op in ["setNumber", "appendText", "setText"] {
         for (reference, text) in [
             ("A1", "2"),
             ("B1", "rich"),
@@ -351,6 +415,10 @@ fn new_text_operations_preserve_existing_safety_refusals() {
             ("D1", "_x000A_"),
             ("E1", "1"),
         ] {
+            // appendText alone accepts existing rich runs (B1 shared, C1 inline).
+            if op == "appendText" && ["B1", "C1"].contains(&reference) {
+                continue;
+            }
             let value = if op == "setNumber" {
                 json!(42)
             } else {
@@ -737,7 +805,8 @@ fn every_successful_response_announces_protocol_features() {
         "validateOnly",
         "compactInspect",
         "setFormula",
-        "insertRows"
+        "insertRows",
+        "appendRichText"
     ]);
     let full = fixture.inspect("full", "A1");
     let compact_report = fixture.inspect("compact", "A1");

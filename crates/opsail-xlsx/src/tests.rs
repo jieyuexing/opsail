@@ -13,6 +13,14 @@ fn styles_xml() -> String {
     )
 }
 fn fixture(sheet: &str, styles: &str, shared: &str) -> (TempDir, std::path::PathBuf) {
+    fixture_parts(
+        sheet,
+        styles,
+        &format!(r#"<sst xmlns="{MAIN}">{shared}</sst>"#),
+    )
+}
+/// Like fixture, but takes the complete sharedStrings document.
+fn fixture_parts(sheet: &str, styles: &str, shared: &str) -> (TempDir, std::path::PathBuf) {
     let dir = TempDir::new().unwrap();
     let source = dir.path().join("source.xlsx");
     let mut zip = ZipWriter::new(fs::File::create(&source).unwrap());
@@ -23,13 +31,12 @@ fn fixture(sheet: &str, styles: &str, shared: &str) -> (TempDir, std::path::Path
         r#"<Relationships><Relationship Id="s" Type="{REL}/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="style" Type="{REL}/styles" Target="styles.xml"/><Relationship Id="shared" Type="{REL}/sharedStrings" Target="sharedStrings.xml"/></Relationships>"#
     );
     let sheet = format!(r#"<worksheet xmlns="{MAIN}">{sheet}</worksheet>"#);
-    let shared = format!(r#"<sst xmlns="{MAIN}">{shared}</sst>"#);
     for (name, content) in [
         ("xl/workbook.xml", workbook.as_str()),
         ("xl/_rels/workbook.xml.rels", rels.as_str()),
         ("xl/worksheets/sheet1.xml", sheet.as_str()),
         ("xl/styles.xml", styles),
-        ("xl/sharedStrings.xml", shared.as_str()),
+        ("xl/sharedStrings.xml", shared),
     ] {
         zip.start_file(name, SimpleFileOptions::default()).unwrap();
         zip.write_all(content.as_bytes()).unwrap();
@@ -216,7 +223,8 @@ fn compact_inspect_shape_parts_defaults_and_capabilities() {
             "validateOnly",
             "compactInspect",
             "setFormula",
-            "insertRows"
+            "insertRows",
+            "appendRichText"
         ])
     );
     let full = inspect(&source, &["Data!A1:C1"], false);
@@ -239,7 +247,7 @@ fn validate_requires_sha_ignores_output_and_retains_envelope() {
     assert_eq!(result["schemaVersion"], 1);
     assert_eq!(result["visualVerification"], "pending");
     assert!(result["proofBoundary"].as_str().is_some());
-    assert_eq!(result["protocolFeatures"].as_array().unwrap().len(), 8);
+    assert_eq!(result["protocolFeatures"].as_array().unwrap().len(), 9);
     let mut existing = request.clone();
     existing["output"] = json!(source);
     assert_eq!(execute(existing).unwrap(), result);
@@ -343,4 +351,151 @@ fn signed_workbooks_still_refuse_new_operations() {
             .contains("digitally signed")
     );
     assert_eq!(report["wouldChangeParts"], json!([]));
+}
+
+#[test]
+fn append_text_to_rich_shared_string_changes_only_target_cell() {
+    let runs = r#"<r><rPr><sz val="9"/><color rgb="FF0070C0"/><rFont val="Arial"/><charset val="134"/></rPr><t>blue</t></r><r><rPr><sz val="9"/><color rgb="FF008080"/><rFont val="Arial"/><charset val="134"/></rPr><t xml:space="preserve"> teal</t></r>"#;
+    let (dir, source) = fixture(
+        r#"<sheetData><row r="1"><c r="A1" s="1" t="s"><v>0</v></c><c r="B1" t="s"><v>0</v></c></row></sheetData>"#,
+        &styles_xml(),
+        &format!(r#"<si>{runs}</si>"#),
+    );
+    let ops = |expected: &str| {
+        json!([{"op":"appendText","sheet":"Data","cell":"A1","expectedText":expected,
+            "value":" new","fontColor":"ff0000","bold":true}])
+    };
+    let report = patch(&source, None, ops("blue teal"), true).unwrap();
+    assert_eq!(report["violations"], json!([]));
+    assert_eq!(
+        report["wouldChangeParts"],
+        json!(["xl/worksheets/sheet1.xml"])
+    );
+    let report = patch(&source, None, ops("blue"), true).unwrap();
+    assert!(
+        report["violations"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("expectedText does not match")
+    );
+    assert!(
+        patch(
+            &source,
+            Some(&dir.path().join("bad.xlsx")),
+            ops("blue"),
+            false
+        )
+        .is_err()
+    );
+    let output = dir.path().join("rich.xlsx");
+    let report = patch(&source, Some(&output), ops("blue teal"), false).unwrap();
+    assert_eq!(report["changedParts"], json!(["xl/worksheets/sheet1.xml"]));
+    let shared = doc(&source, "xl/sharedStrings.xml");
+    let original: Vec<_> = shared
+        .root()
+        .unwrap()
+        .child("si")
+        .unwrap()
+        .elements()
+        .collect();
+    let sheet = doc(&output, "xl/worksheets/sheet1.xml");
+    let c = cells(&sheet);
+    assert_eq!(
+        (c[0].attrs["t"].as_str(), c[0].attrs["s"].as_str()),
+        ("inlineStr", "1")
+    );
+    let appended: Vec<_> = c[0].child("is").unwrap().elements().collect();
+    assert_eq!(appended.len(), 3);
+    assert_eq!(appended[..2], original[..]);
+    let p = appended[2].child("rPr").unwrap();
+    assert_eq!(
+        p.elements().map(Element::local_name).collect::<Vec<_>>(),
+        ["b", "sz", "color", "rFont", "charset"]
+    );
+    assert_eq!(p.child("color").unwrap().attrs["rgb"], "FFFF0000");
+    assert_eq!(p.child("b").unwrap().attrs["val"], "1");
+    assert_eq!(p.child("rFont").unwrap().attrs["val"], "Arial");
+    assert_eq!(appended[2].child("t").unwrap().text(), " new");
+    // The other reference keeps the unchanged shared item.
+    assert_eq!(c[1].attrs["t"], "s");
+    assert_eq!(c[1].child("v").unwrap().text(), "0");
+    assert_eq!(
+        package(&source).parts["xl/sharedStrings.xml"],
+        package(&output).parts["xl/sharedStrings.xml"]
+    );
+    let view = inspect(&output, &["Data!A1:B1"], true);
+    assert_eq!(view["cells"][0]["text"], "blue teal new");
+    assert_eq!(view["cells"][1]["text"], "blue teal");
+}
+
+#[test]
+fn append_text_rich_fallbacks_prefixes_and_refusals() {
+    let (dir, source) = fixture_parts(
+        r#"<sheetData><row r="1"><c r="A1" s="1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c><c r="C1" t="s"><v>2</v></c></row></sheetData>"#,
+        &styles_xml(),
+        &format!(
+            r#"<x:sst xmlns:x="{MAIN}"><x:si><x:r><x:t>no font</x:t></x:r></x:si><x:si><x:r><x:rPr><x:color rgb="FF0070C0"/></x:rPr><x:t>prefixed</x:t></x:r></x:si><x:si><x:r><x:t>ruby</x:t></x:r><x:rPh sb="0" eb="4"><x:t>rubi</x:t></x:rPh><x:phoneticPr fontId="0"/></x:si></x:sst>"#
+        ),
+    );
+    let refused = patch(
+        &source,
+        None,
+        json!([
+            {"op":"appendText","sheet":"Data","cell":"C1","expectedText":"ruby","value":"!"},
+            {"op":"setText","sheet":"Data","cell":"A1","expectedText":"no font","value":"x"},
+            {"op":"setNumber","sheet":"Data","cell":"B1","expectedText":"prefixed","value":1}
+        ]),
+        true,
+    )
+    .unwrap();
+    let messages: Vec<_> = refused["violations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["message"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(messages.len(), 3);
+    assert!(messages[0].contains("phonetic annotations"));
+    assert!(messages[1].contains("rich text"));
+    assert!(messages[2].contains("rich text"));
+    let output = dir.path().join("rich.xlsx");
+    patch(
+        &source,
+        Some(&output),
+        json!([
+            {"op":"appendText","sheet":"Data","cell":"A1","expectedText":"no font","value":" cell font"},
+            {"op":"appendText","sheet":"Data","cell":"B1","expectedText":"prefixed","value":" teal","fontColor":"008080"}
+        ]),
+        false,
+    )
+    .unwrap();
+    let sheet = doc(&output, "xl/worksheets/sheet1.xml");
+    let c = cells(&sheet);
+    // A run without rPr falls back to the stored cell font, as for plain text.
+    let runs: Vec<_> = c[0].child("is").unwrap().elements().collect();
+    assert!(runs[0].child("rPr").is_none());
+    let p = runs[1].child("rPr").unwrap();
+    assert_eq!(p.child("rFont").unwrap().attrs["val"], "Yu Gothic");
+    assert_eq!(p.child("color").unwrap().attrs["theme"], "2");
+    // Shared-string runs are rebound to the worksheet's (default) prefix.
+    let runs: Vec<_> = c[1].child("is").unwrap().elements().collect();
+    fn names(e: &Element, out: &mut Vec<String>) {
+        out.push(e.name.clone());
+        e.elements().for_each(|c| names(c, out));
+    }
+    let mut all = Vec::new();
+    runs.iter().for_each(|r| names(r, &mut all));
+    assert!(all.iter().all(|n| !n.contains(':')), "{all:?}");
+    assert_eq!(
+        runs[0].child("rPr").unwrap().child("color").unwrap().attrs["rgb"],
+        "FF0070C0"
+    );
+    assert_eq!(
+        runs[1].child("rPr").unwrap().child("color").unwrap().attrs["rgb"],
+        "FF008080"
+    );
+    let view = inspect(&output, &["Data!A1:C1"], true);
+    assert_eq!(view["cells"][0]["text"], "no font cell font");
+    assert_eq!(view["cells"][1]["text"], "prefixed teal");
+    assert_eq!(view["cells"][2]["text"], "ruby");
 }

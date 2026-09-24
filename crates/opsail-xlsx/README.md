@@ -47,8 +47,17 @@ blank/missing cells. It writes the shortest round-trip f64 representation
 `appendText` writes inline rich runs: the old and appended text each receive a
 copy of the stored cell font; only the appended run receives the requested
 color/bold/strike overrides. Empty old text produces one run. The cell style ID
-does not change. Existing rich strings, formulas, OOXML escapes, ambiguous
-disabled font application and unsupported font properties are refused.
+does not change. `appendText` also accepts an existing rich string (shared or
+inline): `expectedText` is the concatenated run text, every existing run and any
+leading plain `<t>` is copied unchanged (shared-string elements take the
+worksheet's prefix), and one run is added whose font copies the last run's
+`rPr` in its stored order, with only the requested overrides replaced in place
+or inserted in CT_RPrElt order; a last run without `rPr` uses the cell font.
+The shared `<si>` is never edited, so other references keep it. Phonetic
+annotations (`rPh`/`phoneticPr`), foreign XML inside the string, formulas, OOXML
+escapes, ambiguous disabled font application and unsupported font/run
+properties are refused. `setText`, `setNumber` and `setFormula` still refuse
+rich strings.
 
 `setFormula` accepts a plain expression with or without a leading `=`; the
 stored expression must contain 1–8192 UTF-16 units, legal XML characters and no
@@ -91,7 +100,8 @@ reduction is a goal, not an acceptance gate. It omits
 retain sheet summaries, source SHA, total/truncated counts and proof boundary.
 Every successful inspect/patch/validation/diff response advertises
 `protocolFeatures: ["createCells", "setNumber", "appendText",
-"copyStyleAdoptBase", "validateOnly", "compactInspect", "setFormula", "insertRows"]`; schemaVersion remains 1.
+"copyStyleAdoptBase", "validateOnly", "compactInspect", "setFormula", "insertRows",
+"appendRichText"]`; schemaVersion remains 1.
 
 The package is read once into a bounded snapshot. Publication validates expanded
 size and all modified XML, reloads the candidate with this crate's workbook
@@ -152,7 +162,8 @@ returns row, column and merge attributes.
 This version supports UTF-8 transitional SpreadsheetML with conventional
 `xl/workbook.xml`, worksheet sheets, a styles relationship and one stable main
 namespace prefix per XML part. Unsupported forms fail explicitly. Protected
-sheets, signed packages, rich-text text/font edits, OOXML text escapes, ambiguous
+sheets, signed packages, rich-text replacement/font edits (appending a run is
+supported), phonetic strings, OOXML text escapes, ambiguous
 inherited style application and partial copies across incompatible donor base
 styles require a native application. Column insertion, row/column deletion, direct merge changes and non-plain formula editing are not operations.
 
@@ -172,8 +183,8 @@ cargo +1.97.0 test -p opsail --test xlsx_edit_cli
 ```
 
 Regression fixtures cover shared strings, formula changes, style renumbering,
-alignment preservation and removal, column-span properties, merge/rich-text
-rejection, size limits, conflicting candidate writers, cleanup, and XML
+alignment preservation and removal, column-span properties, rich-text append
+and merge/rich-text replacement rejection, size limits, conflicting candidate writers, cleanup, and XML
 namespace/reference/newline handling. Real-workbook acceptance additionally uses
 an independent XML parser and compares unmodified compressed ZIP payloads.
 

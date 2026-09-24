@@ -336,6 +336,39 @@ impl Book {
         }
         Ok(String::new())
     }
+    /// appendText alone may keep existing rich runs; other text edits keep the
+    /// editable_text refusal. Returns the run-concatenated text and rich item.
+    fn appendable_text<'a>(
+        &'a self,
+        cell: Option<&'a Element>,
+    ) -> Result<(String, Option<&'a Element>)> {
+        let item = cell
+            .filter(|c| c.child("f").is_none())
+            .map(|c| self.string_item(c))
+            .transpose()?
+            .flatten()
+            .filter(|i| i.child("r").is_some());
+        let Some(item) = item else {
+            return Ok((self.editable_text(cell, false)?, None));
+        };
+        if item
+            .elements()
+            .any(|e| ["rPh", "phoneticPr"].contains(&e.local_name()))
+        {
+            return Err(invalid(
+                "phonetic annotations (rPh/phoneticPr) require native application",
+            ));
+        }
+        if item
+            .elements()
+            .any(|e| !["t", "r"].contains(&e.local_name()))
+        {
+            return Err(invalid(
+                "rich text or annotated string requires native application",
+            ));
+        }
+        Ok((string_text(item), Some(item)))
+    }
     fn string_item<'a>(&'a self, c: &'a Element) -> Result<Option<&'a Element>> {
         match c.attrs.get("t").map(String::as_str) {
             Some("s") => {
@@ -714,7 +747,7 @@ impl Book {
             } => {
                 address(cell)?;
                 sheet.check_merge(&Area::parse(cell)?)?;
-                let old = self.editable_text(sheet.cell(cell)?, false)?;
+                let (old, rich) = self.appendable_text(sheet.cell(cell)?)?;
                 if &old != expected_text {
                     return Err(Error::Request(format!(
                         "expectedText does not match {name}!{cell}"
@@ -735,35 +768,44 @@ impl Book {
                 }
                 let id = sheet.style_id(cell)?;
                 let parent = sheet.root()?;
+                let overrides = Style {
+                    font_color: font_color.clone(),
+                    bold: *bold,
+                    strike: *strike,
+                    ..Style::default()
+                };
                 let mut inline = styles::make(parent, "is");
-                for (text, overrides) in [
-                    (&old, Style::default()),
-                    (
-                        value,
-                        Style {
-                            font_color: font_color.clone(),
-                            bold: *bold,
-                            strike: *strike,
-                            ..Style::default()
-                        },
-                    ),
-                ] {
-                    if text.is_empty() {
-                        continue;
+                let mut last = None;
+                if let Some(item) = rich {
+                    // Existing runs are copied unchanged, including their stored
+                    // rPr order; only the element prefix follows the sheet part.
+                    let prefix = prefix(&item.name);
+                    for e in item.elements() {
+                        inline
+                            .children
+                            .push(Node::Element(rebind(e, prefix, parent)?));
                     }
-                    let mut run = styles::make(parent, "r");
-                    run.children.push(Node::Element(styles::run_properties(
-                        &self.styles,
-                        id,
-                        parent,
-                        &overrides,
-                    )?));
-                    let mut t = styles::make(parent, "t");
-                    t.attrs.insert("xml:space".into(), "preserve".into());
-                    t.children.push(Node::Text(text.clone()));
-                    run.children.push(Node::Element(t));
-                    inline.children.push(Node::Element(run));
+                    last = item
+                        .elements()
+                        .filter(|e| e.local_name() == "r")
+                        .last()
+                        .and_then(|r| r.child("rPr"))
+                        .map(|p| rebind(p, prefix, parent))
+                        .transpose()?;
+                } else if !old.is_empty() {
+                    let properties =
+                        styles::run_properties(&self.styles, id, parent, &Style::default())?;
+                    inline
+                        .children
+                        .push(Node::Element(text_run(parent, &old, properties)));
                 }
+                let properties = match &last {
+                    Some(p) => styles::override_run_properties(p, parent, &overrides)?,
+                    None => styles::run_properties(&self.styles, id, parent, &overrides)?,
+                };
+                inline
+                    .children
+                    .push(Node::Element(text_run(parent, value, properties)));
                 let c = self.sheets.get_mut(name).unwrap().cell_mut(cell)?;
                 c.attrs.insert("t".into(), "inlineStr".into());
                 replace_value(c, inline);
@@ -1015,6 +1057,41 @@ fn replace_value(cell: &mut Element, value: Element) {
         .position(|n| matches!(n,Node::Element(e) if e.local_name()=="extLst"))
         .unwrap_or(cell.children.len());
     cell.children.insert(at, Node::Element(value));
+}
+fn text_run(parent: &Element, text: &str, properties: Element) -> Element {
+    let mut run = styles::make(parent, "r");
+    run.children.push(Node::Element(properties));
+    let mut t = styles::make(parent, "t");
+    t.attrs.insert("xml:space".into(), "preserve".into());
+    t.children.push(Node::Text(text.into()));
+    run.children.push(Node::Element(t));
+    run
+}
+fn prefix(name: &str) -> Option<&str> {
+    name.rsplit_once(':').map(|(p, _)| p)
+}
+/// Copy a SpreadsheetML string subtree (for example from sharedStrings.xml)
+/// under the target part's prefix. Foreign elements, namespace declarations
+/// and prefixed attributes other than xml:* cannot be moved safely.
+fn rebind(e: &Element, source: Option<&str>, parent: &Element) -> Result<Element> {
+    if prefix(&e.name) != source
+        || e.attrs
+            .keys()
+            .any(|k| k == "xmlns" || k.contains(':') && !k.starts_with("xml:"))
+    {
+        return Err(invalid(
+            "foreign XML inside rich text requires native application",
+        ));
+    }
+    let mut copy = styles::make(parent, e.local_name());
+    copy.attrs = e.attrs.clone();
+    for node in &e.children {
+        copy.children.push(match node {
+            Node::Element(child) => Node::Element(rebind(child, source, parent)?),
+            other => other.clone(),
+        });
+    }
+    Ok(copy)
 }
 fn string_text(item: &Element) -> String {
     item.elements()
