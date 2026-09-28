@@ -42,7 +42,7 @@ enum GatewayCommand {
     Rekey,
     /// Send a bounded HTTP request described by JSON on stdin (or --input).
     Request(InputArgs),
-    /// List models supported by an OpenAI-compatible endpoint.
+    /// List models from an OpenAI-compatible endpoint or the logged-in Grok CLI.
     Models {
         connection: String,
         #[arg(long)]
@@ -62,11 +62,13 @@ struct InputArgs {
     input: PathBuf,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum AdapterArg {
     Http,
     OpenaiCompatible,
     VercelAiGateway,
+    /// Subscription login; no API key. Sandboxed models/chat only (no request/evaluate).
+    GrokCli,
 }
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum AuthArg {
@@ -90,7 +92,7 @@ enum ConnectionCommand {
     Set {
         name: String,
         #[arg(long)]
-        base_url: String,
+        base_url: Option<String>,
         #[arg(long, value_enum)]
         adapter: AdapterArg,
         #[arg(long, value_enum, default_value = "bearer")]
@@ -99,6 +101,9 @@ enum ConnectionCommand {
         auth_header: Option<String>,
         #[arg(long)]
         model: Option<String>,
+        /// Persist a Grok executable override; otherwise OPSAIL_GROK_PATH then PATH.
+        #[arg(long)]
+        grok_path: Option<PathBuf>,
         #[arg(long)]
         allow_http: bool,
     },
@@ -202,8 +207,65 @@ async fn human_request(command: Option<GatewayCommand>) -> Result<Envelope, Gate
                 auth,
                 auth_header,
                 model,
+                grok_path,
                 allow_http,
             } => {
+                if adapter == AdapterArg::GrokCli
+                    && (!matches!(auth, AuthArg::None) || auth_header.is_some() || allow_http)
+                {
+                    return Err(GatewayError::new(
+                        "invalid-request",
+                        "input",
+                        "grok-cli requires --auth none and does not accept --auth-header or --allow-http",
+                    ));
+                }
+                if adapter != AdapterArg::GrokCli && grok_path.is_some() {
+                    return Err(GatewayError::new(
+                        "invalid-request",
+                        "input",
+                        "--grok-path requires --adapter grok-cli",
+                    ));
+                }
+                let base_url = base_url
+                    .or_else(|| (adapter == AdapterArg::GrokCli).then(|| "grok-cli:".to_owned()))
+                    .ok_or_else(|| {
+                        GatewayError::new(
+                            "invalid-request",
+                            "input",
+                            "--base-url is required for HTTP adapters",
+                        )
+                    })?;
+                if adapter == AdapterArg::GrokCli && base_url != "grok-cli:" {
+                    return Err(GatewayError::new(
+                        "invalid-request",
+                        "input",
+                        "grok-cli uses the fixed base URL grok-cli:",
+                    ));
+                }
+                let grok_path = grok_path
+                    .map(|path| {
+                        let path = if path.is_absolute() {
+                            path
+                        } else {
+                            std::env::current_dir()
+                                .map_err(|_| {
+                                    GatewayError::new(
+                                        "invalid-request",
+                                        "input",
+                                        "could not resolve --grok-path",
+                                    )
+                                })?
+                                .join(path)
+                        };
+                        path.into_os_string().into_string().map_err(|_| {
+                            GatewayError::new(
+                                "invalid-request",
+                                "input",
+                                "--grok-path must be UTF-8",
+                            )
+                        })
+                    })
+                    .transpose()?;
                 let auth = match auth {
                     AuthArg::None => Auth::None,
                     AuthArg::Bearer => Auth::Bearer {
@@ -224,6 +286,7 @@ async fn human_request(command: Option<GatewayCommand>) -> Result<Envelope, Gate
                     AdapterArg::Http => Adapter::Http,
                     AdapterArg::OpenaiCompatible => Adapter::OpenaiCompatible,
                     AdapterArg::VercelAiGateway => Adapter::VercelAiGateway,
+                    AdapterArg::GrokCli => Adapter::GrokCli,
                 };
                 GatewayRequest::Set {
                     connection: Connection {
@@ -232,6 +295,7 @@ async fn human_request(command: Option<GatewayCommand>) -> Result<Envelope, Gate
                         adapter,
                         auth,
                         default_model: model,
+                        grok_path,
                         allow_http,
                     },
                 }

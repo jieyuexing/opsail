@@ -1178,3 +1178,54 @@ $result = @{
     assert_eq!(value["providers"][0]["usedPercent"].as_f64(), Some(25.0));
     assert_eq!(value["providers"][0]["planType"], "plus");
 }
+
+#[test]
+fn gateway_grok_connection_help_and_auth_validation() {
+    cargo_bin_cmd!("opsail")
+        .args(["gateway", "connection", "set", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("grok-cli").and(predicate::str::contains("--grok-path")));
+    // Invalid Grok authentication must fail before opening the API-key prompt.
+    let output = cargo_bin_cmd!("opsail")
+        .args([
+            "gateway",
+            "connection",
+            "set",
+            "grok",
+            "--adapter",
+            "grok-cli",
+            "--auth",
+            "bearer",
+        ])
+        .assert()
+        .failure();
+    let value: serde_json::Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+    assert_eq!(value["error"]["code"], "invalid-request");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--auth none")
+    );
+    // --base-url remains required for existing adapters, before credential prompts.
+    let output = cargo_bin_cmd!("opsail")
+        .args([
+            "gateway",
+            "connection",
+            "set",
+            "cloud",
+            "--adapter",
+            "openai-compatible",
+        ])
+        .assert()
+        .failure();
+    let value: serde_json::Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+    assert_eq!(value["error"]["code"], "invalid-request");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--base-url")
+    );
+}

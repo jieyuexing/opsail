@@ -20,6 +20,7 @@ fn connection(base: &str) -> Connection {
             key: Secret::new("fixture-api-key".into()),
         },
         default_model: Some("fixture-model".into()),
+        grok_path: None,
         allow_http: false,
     }
 }

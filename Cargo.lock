@@ -2059,6 +2059,7 @@ dependencies = [
  "directories",
  "fs2",
  "libc",
+ "process-wrap",
  "reqwest",
  "rustls",
  "serde",

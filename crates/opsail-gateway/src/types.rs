@@ -31,6 +31,7 @@ pub enum Adapter {
     Http,
     OpenaiCompatible,
     VercelAiGateway,
+    GrokCli,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -59,6 +60,9 @@ pub struct Connection {
     pub auth: Auth,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    /// Optional executable override, persisted only when explicitly supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grok_path: Option<String>,
     #[serde(default)]
     pub allow_http: bool,
 }
@@ -75,6 +79,8 @@ pub struct ConnectionSummary {
     pub has_key: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grok_path: Option<String>,
     pub allow_http: bool,
 }
 
@@ -93,6 +99,7 @@ impl From<&Connection> for ConnectionSummary {
             auth_header,
             has_key: c.auth.key().is_some(),
             default_model: c.default_model.clone(),
+            grok_path: c.grok_path.clone(),
             allow_http: c.allow_http,
         }
     }

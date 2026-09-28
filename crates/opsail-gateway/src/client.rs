@@ -29,6 +29,35 @@ pub(crate) fn validate_connection(c: &Connection) -> Result<Url, GatewayError> {
             "connection name must use 1 to 64 ASCII letters, digits, dots, underscores or hyphens",
         ));
     }
+    if c.adapter == Adapter::GrokCli {
+        if c.default_model
+            .as_ref()
+            .is_some_and(|m| m.is_empty() || m.len() > 256 || m.contains('\0'))
+        {
+            return Err(GatewayError::input(
+                "defaultModel must contain 1 to 256 bytes without NUL",
+            ));
+        }
+        if c.base_url != "grok-cli:" || !matches!(c.auth, Auth::None) || c.allow_http {
+            return Err(GatewayError::input(
+                "grok-cli requires baseUrl grok-cli:, auth none and allowHttp false",
+            ));
+        }
+        if c.grok_path
+            .as_ref()
+            .is_some_and(|p| p.is_empty() || p.len() > 4096 || p.contains('\0'))
+        {
+            return Err(GatewayError::input(
+                "grokPath must contain 1 to 4096 bytes without NUL",
+            ));
+        }
+        return Url::parse("grok-cli:").map_err(|_| GatewayError::input("invalid Grok endpoint"));
+    }
+    if c.grok_path.is_some() {
+        return Err(GatewayError::input(
+            "grokPath is only supported by grok-cli",
+        ));
+    }
     let mut url = Url::parse(&c.base_url)
         .map_err(|_| GatewayError::input("baseUrl must be an absolute HTTP(S) URL"))?;
     if !matches!(url.scheme(), "http" | "https")
@@ -311,6 +340,9 @@ pub(crate) async fn call(
 ) -> Result<GatewayResult, GatewayError> {
     let operation = request.operation().to_owned();
     let base = validate_connection(&c)?;
+    if c.adapter == Adapter::GrokCli {
+        return crate::grok::call(c, request, passphrase).await;
+    }
     let expected_questions = match &request {
         GatewayRequest::Evaluate { questions, .. } => Some(questions.clone()),
         _ => None,
@@ -601,7 +633,7 @@ fn evaluation_input(value: &Value) -> bool {
     value.is_string() || value.is_object() || value.is_array()
 }
 
-fn redact(data: &mut Value, secrets: &[&str]) {
+pub(crate) fn redact(data: &mut Value, secrets: &[&str]) {
     match data {
         Value::String(s) => {
             for secret in secrets.iter().filter(|s| !s.is_empty()) {

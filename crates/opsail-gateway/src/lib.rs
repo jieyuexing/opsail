@@ -1,5 +1,6 @@
-//! Encrypted connection storage and bounded, non-streaming API calls.
+//! Encrypted connection storage and bounded, non-streaming HTTP and Grok CLI calls.
 mod client;
+mod grok;
 #[cfg(test)]
 mod tests;
 mod types;
@@ -10,7 +11,8 @@ pub use vault::{Vault, default_data_dir};
 
 use serde_json::json;
 
-/// Dropping this future cancels an in-flight HTTP request. Vault writes run to
+/// Dropping this future cancels an HTTP request or kills the owned Grok process
+/// group. Vault writes run to
 /// their atomic commit boundary even if a caller cancels while waiting.
 pub async fn execute(
     vault: Vault,

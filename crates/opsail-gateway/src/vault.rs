@@ -295,3 +295,60 @@ fn unlock_error() -> GatewayError {
 fn io_error(_: std::io::Error) -> GatewayError {
     GatewayError::vault("vault-io-failed", "could not access the vault")
 }
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    #[test]
+    fn legacy_three_connection_ciphertext_roundtrips_without_field_changes() {
+        // Historical schema shape with fictitious keys; never reads the user's vault.
+        let old = json!({"schemaVersion":1,"connections":{
+            "deepseek":{"name":"deepseek","adapter":"openai-compatible","baseUrl":"https://api.deepseek.test/v1","auth":{"type":"bearer","key":"fixture-deepseek"},"defaultModel":"deepseek-chat","allowHttp":false},
+            "mimo":{"name":"mimo","adapter":"openai-compatible","baseUrl":"https://api.mimo.test/v1","auth":{"type":"header","name":"api-key","key":"fixture-mimo"},"defaultModel":"mimo-v2.6-flash","allowHttp":false},
+            "v2ex":{"name":"v2ex","adapter":"openai-compatible","baseUrl":"https://api.v2ex.test/v1","auth":{"type":"bearer","key":"fixture-v2ex"},"allowHttp":false}
+        }});
+        let pass = Secret::new("fixture-old-vault".into());
+        let temp = tempfile::tempdir().unwrap();
+        let vault = Vault::new(temp.path().to_owned());
+        // Encrypt the literal old JSON directly, independently of Connection serialization.
+        let mut recipient =
+            age::scrypt::Recipient::new(SecretString::from(pass.expose().to_owned()));
+        recipient.set_work_factor(10);
+        let encryptor =
+            age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))
+                .unwrap();
+        let mut bytes = Vec::new();
+        let mut writer = encryptor.wrap_output(&mut bytes).unwrap();
+        writer
+            .write_all(&serde_json::to_vec(&old).unwrap())
+            .unwrap();
+        writer.finish().unwrap();
+        fs::write(vault.path(), bytes).unwrap();
+        assert_eq!(
+            serde_json::to_value(vault.read(&pass).unwrap()).unwrap(),
+            old
+        );
+        let grok: Connection = serde_json::from_value(json!({"name":"grok","adapter":"grok-cli","baseUrl":"grok-cli:","auth":{"type":"none"},"allowHttp":false,"grokPath":"/fixture/grok"})).unwrap();
+        vault.set(&pass, grok).unwrap();
+        let rewritten = serde_json::to_value(vault.read(&pass).unwrap()).unwrap();
+        for name in ["deepseek", "mimo", "v2ex"] {
+            assert_eq!(rewritten["connections"][name], old["connections"][name]);
+            let stored = vault.get(&pass, name).unwrap();
+            assert_eq!(
+                serde_json::to_value(&stored).unwrap(),
+                old["connections"][name]
+            );
+            let summary: Value =
+                serde_json::to_value(crate::ConnectionSummary::from(&stored)).unwrap();
+            assert!(summary.get("grokPath").is_none());
+        }
+        vault.remove(&pass, "grok").unwrap();
+        let after = serde_json::to_value(vault.read(&pass).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&after).unwrap(),
+            serde_json::to_vec(&old).unwrap()
+        );
+    }
+}
