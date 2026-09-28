@@ -41,7 +41,7 @@ fn record(root: &Element, collection: &str, i: usize) -> Result<Element> {
         .cloned()
         .ok_or_else(|| invalid(format!("{collection} index {i} missing")))
 }
-fn numfmt(root: &Element, id: usize) -> Value {
+pub(crate) fn numfmt(root: &Element, id: usize) -> Value {
     root.child("numFmts")
         .and_then(|x| {
             x.elements().find(|x| {

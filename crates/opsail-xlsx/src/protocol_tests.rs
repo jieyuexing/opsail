@@ -806,7 +806,9 @@ fn every_successful_response_announces_protocol_features() {
         "compactInspect",
         "setFormula",
         "insertRows",
-        "appendRichText"
+        "appendRichText",
+        "semanticDiff",
+        "setRichText"
     ]);
     let full = fixture.inspect("full", "A1");
     let compact_report = fixture.inspect("compact", "A1");

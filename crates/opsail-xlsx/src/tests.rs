@@ -224,7 +224,9 @@ fn compact_inspect_shape_parts_defaults_and_capabilities() {
             "compactInspect",
             "setFormula",
             "insertRows",
-            "appendRichText"
+            "appendRichText",
+            "semanticDiff",
+            "setRichText"
         ])
     );
     let full = inspect(&source, &["Data!A1:C1"], false);
@@ -247,7 +249,7 @@ fn validate_requires_sha_ignores_output_and_retains_envelope() {
     assert_eq!(result["schemaVersion"], 1);
     assert_eq!(result["visualVerification"], "pending");
     assert!(result["proofBoundary"].as_str().is_some());
-    assert_eq!(result["protocolFeatures"].as_array().unwrap().len(), 9);
+    assert_eq!(result["protocolFeatures"].as_array().unwrap().len(), 11);
     let mut existing = request.clone();
     existing["output"] = json!(source);
     assert_eq!(execute(existing).unwrap(), result);

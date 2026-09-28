@@ -80,7 +80,9 @@ fn machine(request: Value, success: bool) -> Value {
                 "compactInspect",
                 "setFormula",
                 "insertRows",
-                "appendRichText"
+                "appendRichText",
+                "semanticDiff",
+                "setRichText"
             ])
         );
     }
@@ -826,4 +828,34 @@ fn machine_insert_rows_seven_enterprise_feature_fixtures() {
             assert!(calc.contains("r=\"A15\""));
         }
     }
+}
+
+#[test]
+fn cli_semantic_diff_accepts_alignment_and_keeps_legacy_fields() {
+    let dir = TempDir::new().unwrap();
+    let source = dir.path().join("source.xlsx");
+    workbook(&source);
+    let assertion = Command::new(assert_cmd::cargo::cargo_bin!("opsail"))
+        .args(["xlsx", "diff"])
+        .arg(&source)
+        .arg(&source)
+        .args(["--semantic", "--align-rows"])
+        .assert()
+        .success();
+    let result: Value = serde_json::from_slice(&assertion.get_output().stdout).unwrap();
+    assert_eq!(result["semantic"]["alignRows"], true);
+    assert_eq!(result["semantic"]["cellChanges"]["total"], 0);
+    assert_eq!(result["cellChanges"]["total"], 0);
+    assert_eq!(result["changedParts"], json!([]));
+    assert_eq!(
+        &result["protocolFeatures"].as_array().unwrap()[9..],
+        &[json!("semanticDiff"), json!("setRichText")]
+    );
+    Command::new(assert_cmd::cargo::cargo_bin!("opsail"))
+        .args(["xlsx", "diff"])
+        .arg(&source)
+        .arg(&source)
+        .arg("--align-rows")
+        .assert()
+        .code(2);
 }

@@ -8,6 +8,8 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 #[path = "insert_rows.rs"]
 mod insert_rows;
+#[path = "semantic.rs"]
+mod semantic;
 const MAIN: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 const MAX_STORED_CELLS: usize = 200000;
@@ -336,8 +338,8 @@ impl Book {
         }
         Ok(String::new())
     }
-    /// appendText alone may keep existing rich runs; other text edits keep the
-    /// editable_text refusal. Returns the run-concatenated text and rich item.
+    /// Text replacement/appending shares annotation and foreign-XML guards.
+    /// Returns the run-concatenated visible text and optional rich item.
     fn appendable_text<'a>(
         &'a self,
         cell: Option<&'a Element>,
@@ -346,8 +348,7 @@ impl Book {
             .filter(|c| c.child("f").is_none())
             .map(|c| self.string_item(c))
             .transpose()?
-            .flatten()
-            .filter(|i| i.child("r").is_some());
+            .flatten();
         let Some(item) = item else {
             return Ok((self.editable_text(cell, false)?, None));
         };
@@ -367,7 +368,8 @@ impl Book {
                 "rich text or annotated string requires native application",
             ));
         }
-        Ok((string_text(item), Some(item)))
+        rebind(item, prefix(&item.name), item)?;
+        Ok((string_text(item), item.child("r").map(|_| item)))
     }
     fn string_item<'a>(&'a self, c: &'a Element) -> Result<Option<&'a Element>> {
         match c.attrs.get("t").map(String::as_str) {
@@ -531,6 +533,7 @@ impl Book {
         let sheet = self.sheet(name)?;
         let targets = match op {
             Operation::SetText { cell, .. }
+            | Operation::SetRichText { cell, .. }
             | Operation::SetNumber { cell, .. }
             | Operation::AppendText { cell, .. }
             | Operation::SetFormula { cell, .. } => Some(Area::parse(cell)?),
@@ -668,6 +671,7 @@ impl Book {
                 cell,
                 expected_text,
                 value,
+                replace_rich_text,
                 ..
             } => {
                 let area = Area::parse(cell)?;
@@ -675,7 +679,16 @@ impl Book {
                     return Err(invalid("setText requires one cell"));
                 }
                 sheet.check_merge(&area)?;
-                let old = self.editable_text(sheet.cell(cell)?, false)?;
+                let old = if *replace_rich_text {
+                    self.appendable_text(sheet.cell(cell)?)?.0
+                } else {
+                    self.editable_text(sheet.cell(cell)?, false).map_err(|error| {
+                        if error.to_string().contains("rich text or annotated string requires native application") {
+                            invalid("rich text or annotated string requires native application; use setText replaceRichText:true or setRichText (plain replacement uses the cell font, including strike=1; use setRichText to override strike)")
+                        } else { error }
+                    })?
+                };
+                self.appendable_text(sheet.cell(cell)?)?;
                 if &old != expected_text {
                     return Err(Error::Request(format!(
                         "expectedText does not match {name}!{cell}"
@@ -707,6 +720,54 @@ impl Book {
                     .position(|n| matches!(n,Node::Element(e) if e.local_name()=="extLst"))
                     .unwrap_or(c.children.len());
                 c.children.insert(at, Node::Element(is));
+                1
+            }
+            Operation::SetRichText {
+                cell,
+                expected_text,
+                runs,
+                ..
+            } => {
+                address(cell)?;
+                sheet.check_merge(&Area::parse(cell)?)?;
+                let (old, _) = self.appendable_text(sheet.cell(cell)?)?;
+                if &old != expected_text {
+                    return Err(Error::Request(format!(
+                        "expectedText does not match {name}!{cell}"
+                    )));
+                }
+                if !(1..=256).contains(&runs.len()) || runs.iter().any(|r| r.text.is_empty()) {
+                    return Err(invalid(
+                        "setRichText requires 1-256 runs with nonempty text",
+                    ));
+                }
+                let text: String = runs.iter().map(|r| r.text.as_str()).collect();
+                if text.encode_utf16().count() > 32767 || text.chars().any(|c| !xml_char(c)) {
+                    return Err(invalid(
+                        "text exceeds Excel length or contains illegal XML characters",
+                    ));
+                }
+                if has_excel_escape(&text) || has_excel_escape(&old) {
+                    return Err(invalid("OOXML escaped text requires native application"));
+                }
+                let id = sheet.style_id(cell)?;
+                let parent = sheet.root()?;
+                let mut inline = styles::make(parent, "is");
+                for run in runs {
+                    let overrides = Style {
+                        font_color: run.font_color.clone(),
+                        bold: run.bold,
+                        strike: run.strike,
+                        ..Style::default()
+                    };
+                    let properties = styles::run_properties(&self.styles, id, parent, &overrides)?;
+                    inline
+                        .children
+                        .push(Node::Element(text_run(parent, &run.text, properties)));
+                }
+                let c = self.sheets.get_mut(name).unwrap().cell_mut(cell)?;
+                c.attrs.insert("t".into(), "inlineStr".into());
+                replace_value(c, inline);
                 1
             }
             Operation::SetNumber {

@@ -2,6 +2,8 @@
 //! This module models stored OOXML, not Excel's rendering/calculation engine.
 mod package;
 mod references;
+#[cfg(test)]
+mod semantic_tests;
 mod styles;
 #[cfg(test)]
 mod tests;
@@ -81,6 +83,10 @@ struct Request {
     operations: Vec<Operation>,
     before: Option<String>,
     after: Option<String>,
+    #[serde(default)]
+    semantic: bool,
+    #[serde(default)]
+    align_rows: bool,
 }
 #[derive(Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -128,11 +134,19 @@ enum Operation {
         bold: Option<bool>,
         strike: Option<bool>,
     },
+    SetRichText {
+        sheet: String,
+        cell: String,
+        expected_text: String,
+        runs: Vec<RichRun>,
+    },
     SetText {
         sheet: String,
         cell: String,
         expected_text: String,
         value: String,
+        #[serde(default)]
+        replace_rich_text: bool,
     },
     SetStyle {
         sheet: String,
@@ -173,6 +187,7 @@ impl Operation {
         match self {
             Self::InsertRows { sheet, .. }
             | Self::SetText { sheet, .. }
+            | Self::SetRichText { sheet, .. }
             | Self::SetFormula { sheet, .. }
             | Self::SetNumber { sheet, .. }
             | Self::AppendText { sheet, .. }
@@ -186,6 +201,7 @@ impl Operation {
     fn location(&self) -> (&str, String) {
         match self {
             Self::InsertRows { before, .. } => ("insertRows", before.to_string()),
+            Self::SetRichText { cell, .. } => ("setRichText", cell.clone()),
             Self::SetText { cell, .. } => ("setText", cell.clone()),
             Self::SetFormula { cell, .. } => ("setFormula", cell.clone()),
             Self::SetNumber { cell, .. } => ("setNumber", cell.clone()),
@@ -207,6 +223,14 @@ impl Operation {
             message: error.to_string(),
         }
     }
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RichRun {
+    text: String,
+    font_color: Option<String>,
+    bold: Option<bool>,
+    strike: Option<bool>,
 }
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -245,7 +269,7 @@ pub fn execute(value: Value) -> Result<Value> {
             "operations",
             "validateOnly",
         ],
-        "diff" => &["before", "after", "maxCells"],
+        "diff" => &["before", "after", "maxCells", "semantic", "alignRows"],
         _ => {
             return Err(Error::Request(
                 "operation must be inspect, patch or diff".into(),
@@ -259,6 +283,9 @@ pub fn execute(value: Value) -> Result<Value> {
                 req.operation
             )));
         }
+    }
+    if value.get("alignRows").is_some() && !req.semantic {
+        return Err(Error::Request("alignRows requires semantic:true".into()));
     }
     let limits = package::Limits::new(req.max_bytes, req.max_expanded_bytes)?;
     if !(1..=2000).contains(&req.max_cells) {
@@ -298,8 +325,13 @@ pub fn execute(value: Value) -> Result<Value> {
                 )?,
                 limits,
             )?;
-            let mut report = workbook::Book::load(&before)?
-                .diff(&workbook::Book::load(&after)?, req.max_cells)?;
+            let before_book = workbook::Book::load(&before)?;
+            let after_book = workbook::Book::load(&after)?;
+            let mut report = before_book.diff(&after_book, req.max_cells)?;
+            if req.semantic {
+                report["semantic"] =
+                    before_book.semantic_diff(&after_book, req.max_cells, req.align_rows)?;
+            }
             report["beforeSha256"] = json!(before.sha());
             report["afterSha256"] = json!(after.sha());
             report["changedParts"] = json!(before.changed_parts(&after));
@@ -407,7 +439,9 @@ fn envelope(operation: &str, mut v: Value) -> Result<Value> {
         "compactInspect",
         "setFormula",
         "insertRows",
-        "appendRichText"
+        "appendRichText",
+        "semanticDiff",
+        "setRichText"
     ]);
     v["visualVerification"] = json!("pending");
     v["proofBoundary"] = json!(
@@ -434,6 +468,9 @@ fn encoded_len(value: &Value) -> Result<usize> {
 fn limit_details(operation: &str, v: &mut Value, limit: usize) -> Result<()> {
     if encoded_len(v)? <= limit {
         return Ok(());
+    }
+    if operation == "diff" && v.get("semantic").is_some() {
+        return limit_semantic_details(v, limit);
     }
     let pointer = match operation {
         "inspect" => "/cells",
@@ -467,6 +504,101 @@ fn limit_details(operation: &str, v: &mut Value, limit: usize) -> Result<()> {
         size += addition;
     }
     *v.pointer_mut(pointer).unwrap() = Value::Array(kept);
+    Ok(())
+}
+
+/// Allocate the byte budget in semantic-first order. Totals never change.
+fn limit_semantic_details(v: &mut Value, limit: usize) -> Result<()> {
+    let paths = [
+        (
+            "/semantic/cellChanges/details",
+            "/semantic/cellChanges/truncated",
+        ),
+        (
+            "/semantic/layoutChanges/rows/details",
+            "/semantic/layoutChanges/rows/truncated",
+        ),
+        (
+            "/semantic/layoutChanges/columns/details",
+            "/semantic/layoutChanges/columns/truncated",
+        ),
+        (
+            "/semantic/layoutChanges/merges",
+            "/semantic/layoutChanges/truncated",
+        ),
+        (
+            "/semantic/layoutChanges/printAreas",
+            "/semantic/layoutChanges/truncated",
+        ),
+        (
+            "/semantic/layoutChanges/sheetDefaults",
+            "/semantic/layoutChanges/truncated",
+        ),
+        (
+            "/semantic/layoutChanges/otherStructure",
+            "/semantic/layoutChanges/truncated",
+        ),
+        (
+            "/semantic/workbookChanges/definedNames",
+            "/semantic/workbookChanges/truncated",
+        ),
+        ("/semantic/rowAlignment", "/semantic/truncated"),
+        ("/cellChanges/details", "/cellChanges/truncated"),
+    ];
+    let mut lists = Vec::new();
+    let mut flags = std::collections::BTreeMap::new();
+    for (path, flag) in paths {
+        flags
+            .entry(flag)
+            .or_insert_with(|| v.pointer(flag).cloned().unwrap_or(json!(false)));
+        if let Some(values) = v.pointer_mut(path).and_then(Value::as_array_mut) {
+            lists.push((path, flag, std::mem::take(values)));
+        }
+    }
+    v["outputTruncated"] = json!(true);
+    for flag in flags.keys() {
+        if let Some(value) = v.pointer_mut(flag) {
+            *value = json!(true);
+        }
+    }
+    // Restoring a flag to false adds one byte; reserve for every distinct flag.
+    let mut size = encoded_len(v)? + flags.len();
+    if size > limit {
+        return Err(invalid(
+            "response metadata exceeds output byte limit; use a smaller workbook",
+        ));
+    }
+    let mut removed = std::collections::BTreeSet::new();
+    let mut semantic_removed = false;
+    let mut layout_removed = false;
+    for (path, flag, values) in lists {
+        let original = values.len();
+        let mut kept = Vec::new();
+        for value in values {
+            let addition = encoded_len(&value)? + usize::from(!kept.is_empty());
+            if size + addition > limit {
+                break;
+            }
+            size += addition;
+            kept.push(value);
+        }
+        if kept.len() < original {
+            removed.insert(flag);
+            semantic_removed |= path.starts_with("/semantic/");
+            layout_removed |= path.starts_with("/semantic/layoutChanges/");
+        }
+        *v.pointer_mut(path).unwrap() = Value::Array(kept);
+    }
+    for (flag, original) in flags {
+        if let Some(value) = v.pointer_mut(flag) {
+            *value = json!(
+                original == true
+                    || removed.contains(flag)
+                    || flag == "/semantic/truncated" && semantic_removed
+                    || flag == "/semantic/layoutChanges/truncated" && layout_removed
+            );
+        }
+    }
     Ok(())
 }
 

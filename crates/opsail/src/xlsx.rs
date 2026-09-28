@@ -45,6 +45,10 @@ enum XlsxCommand {
         after: PathBuf,
         #[arg(long, default_value_t = 200)]
         max_cells: usize,
+        #[arg(long)]
+        semantic: bool,
+        #[arg(long, requires = "semantic")]
+        align_rows: bool,
     },
 }
 
@@ -80,10 +84,20 @@ async fn request(args: XlsxArgs) -> Result<Value, String> {
             before,
             after,
             max_cells,
+            semantic,
+            align_rows,
         } => Ok(json!({
             "schemaVersion": 1, "operation": "diff", "before": before,
-            "after": after, "maxCells": max_cells,
-        })),
+            "after": after, "maxCells": max_cells, "semantic": semantic,
+            // Only send alignRows when semantic is enabled.
+            // Presence on a non-semantic request is deliberately rejected.
+        }))
+        .map(|mut request| {
+            if semantic {
+                request["alignRows"] = json!(align_rows);
+            }
+            request
+        }),
         XlsxCommand::Patch {
             source,
             plan,
