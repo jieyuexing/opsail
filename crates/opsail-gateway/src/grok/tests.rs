@@ -31,7 +31,7 @@ fn stream_success() -> String {
 }
 
 #[test]
-fn event_reader_rejects_tool_preamble_even_when_summary_claims_end_turn() {
+fn event_reader_rejects_explicit_tool_events_even_when_summary_claims_end_turn() {
     assert_eq!(
         parse_events(&stream_success(), None).unwrap()["text"],
         "Hello"
@@ -56,6 +56,15 @@ fn event_reader_rejects_tool_preamble_even_when_summary_claims_end_turn() {
     );
     assert!(parse_events("{\"type\":\"text\",\"data\":\"I'll read it\"}", None).is_err());
     assert!(parse_events(&format!("{}{}", stream_success(), stream_success()), None).is_err());
+
+    // A complete text-only response has no reliable tool-intent signal. This
+    // regression records the boundary observed with real Grok 1.0.41, rather
+    // than claiming the explicit-tool-event fixture covers a promise in text.
+    let preamble = "I'll read that marker file and print its exact contents.";
+    assert_eq!(
+        parse_events(&stream_success().replace("Hello", preamble), None).unwrap()["text"],
+        preamble
+    );
 }
 
 #[test]
@@ -323,11 +332,19 @@ async fn fake_grok_maps_chat_system_model_effort_and_cleans_temp() {
         .filter(|b| !b.is_empty())
         .map(|b| std::str::from_utf8(b).unwrap())
         .collect();
+    let system = argv[argv
+        .iter()
+        .position(|v| *v == "--system-prompt-override")
+        .unwrap()
+        + 1];
+    assert!(system.starts_with("This call has no tools."));
+    assert!(system.contains("cannot read files, run commands, access the network"));
+    assert!(system.contains("state that you cannot do it"));
+    assert_eq!(
+        system,
+        format!("{TEXT_SYSTEM}\n\nSpanish only\n\nNo explanations")
+    );
     for pair in [
-        [
-            "--system-prompt-override",
-            "Spanish only\n\nNo explanations",
-        ],
         ["--model", "grok-default"],
         ["--reasoning-effort", "low"],
         ["--max-turns", "1"],
@@ -345,6 +362,7 @@ async fn fake_grok_maps_chat_system_model_effort_and_cleans_temp() {
     assert!(!Path::new(fs::read_to_string(cwd).unwrap().trim()).exists());
     let p = prepare(&c,request(json!({"operation":"chat","connection":"grok","model":"explicit","messages":[{"role":"user","content":"x"}]}))).unwrap();
     assert_eq!(p.model.as_deref(), Some("explicit"));
+    assert_eq!(p.system, TEXT_SYSTEM);
     c.default_model = None;
     assert!(prepare(&c, chat()).unwrap().model.is_none());
 }

@@ -37,7 +37,13 @@ const DENY_RULES: &[&str] = &[
     "WebSearch",
     "MCPTool",
 ];
-const TEXT_SYSTEM: &str = "Answer the supplied conversation as a text-only model. Do not use tools, access files, browse, spawn agents or invoke MCP.";
+const TEXT_SYSTEM: &str = concat!(
+    "This call has no tools. You cannot read files, run commands, access the network, ",
+    "spawn agents or invoke MCP. Answer directly using the supplied messages and ",
+    "your existing knowledge. If a request requires an unavailable capability, ",
+    "state that you cannot do it instead of promising to do it. ",
+    "Follow the requested language, style and response format."
+);
 
 struct Prepared {
     prompt: Option<String>,
@@ -115,12 +121,18 @@ fn prepare(c: &Connection, request: GatewayRequest) -> Result<Prepared, GatewayE
                 ));
             }
             if !systems.is_empty() {
-                p.system = systems.join("\n\n");
+                // Grok 1.0.41 probes on 2026-09-28 verified that system override
+                // preserves a Spanish-only instruction (2 + 3 -> "cinco"). Keep
+                // that working CLI path and append all caller system text in
+                // order, unchanged, after the fixed capability statement. This
+                // is prompt mitigation, not detection of promises in plain text.
+                p.system.push_str("\n\n");
+                p.system.push_str(&systems.join("\n\n"));
             }
             // System override is an argv string; keep it below portable OS argv limits.
             if p.system.len() > 32 * 1024 || p.system.contains('\0') {
                 return Err(GatewayError::input(
-                    "system text must be at most 32 KiB without NUL",
+                    "combined system text must be at most 32 KiB without NUL",
                 ));
             }
             p.prompt = Some(turns.join("\n\n"));
@@ -579,9 +591,10 @@ fn parse_chat(text: &str, requested_model: Option<&str>) -> Result<Value, Gatewa
     Ok(data)
 }
 fn parse_events(text: &str, requested_model: Option<&str>) -> Result<Value, GatewayError> {
-    // Grok 1.0.41 can report end_turn + num_turns=1 even after a tool attempt
-    // exhausts --max-turns. Observe native events as well, instead of accepting
-    // its JSON summary's half-sentence preamble as a completed model answer.
+    // Reject explicit tool events even if the terminal summary claims success.
+    // The 2026-09-28 Grok 1.0.41 probes also returned promises as ordinary text
+    // with end_turn + num_turns=1 and no tool event, even in Messages partials.
+    // Such text has no reliable protocol signal and passes through unchanged.
     let mut answer = String::new();
     let mut thought = String::new();
     let mut end = None;

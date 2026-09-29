@@ -175,14 +175,20 @@ Boolean, plus `data.defaultModel` from `grok models`. Chat selects the explicit
 model, then the stored default, then the CLI's own default. `data.model` reports
 the actual model from the CLI ledger where available; it may differ from the
 requested alias. Text, stopReason, sessionId, usage and num_turns are retained.
-System messages are joined with blank lines and supplied as
-`--system-prompt-override` (verified with Grok 1.0.41). User/assistant turns become
+Every chat prepends a fixed capability statement: this call has no tools, cannot
+read files, run commands, access the network, spawn agents or invoke MCP, and
+should answer directly or state inability instead of promising an action.
+Caller system messages follow unchanged, in order and joined with blank lines;
+the combined text is supplied as `--system-prompt-override` (verified with Grok
+1.0.41). The statement asks the model to retain the requested language, style
+and response format. User/assistant turns become
 `[user]` / `[assistant]` labeled plain text, not native conversation history.
 Content accepts strings or arrays consisting entirely of text blocks. Tool
 messages, extra message fields and non-text blocks are rejected. Only canonical
 `reasoningEffort` levels (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`)
 are accepted; model support is decided by Grok. No generation parameter silently
-falls through. System text is bounded to 32 KiB because the CLI accepts it on argv;
+falls through. Combined system text, including the fixed statement, is bounded
+to 32 KiB because the CLI accepts it on argv;
 the conversation uses an absolute `--prompt-file` in the temporary cwd.
 
 Every invocation creates a unique directory under `std::env::temp_dir()` and
@@ -209,13 +215,25 @@ Tool access is separately removed using internal IDs, `Agent`, a minimal
 allowlist followed by the denylist, `--no-subagents`, `--disable-web-search`,
 `--permission-mode dontAsk`, and deny-all plus Read/Grep/Bash/Edit/Write/WebFetch/
 WebSearch/MCPTool rules. `--max-turns 1` bounds inference. The adapter internally
-consumes bounded native events to reject any tool attempt, including a preamble
-whose final summary misleadingly reports `end_turn` and one turn. Incomplete
-responses return `grok-incomplete-response`; observed tool events return
-`grok-tool-attempt`. External Gateway output remains one non-streaming result.
+consumes bounded native events: incomplete responses return
+`grok-incomplete-response`; observed tool events return `grok-tool-attempt`, even
+when the final summary reports `end_turn` and one turn. The truncation fixtures
+cover explicit tool events, incomplete stop reasons and missing terminal events;
+they do not prove detection of promises expressed only in text.
+External Gateway output remains one non-streaming result.
 Any sandbox failure, missing profile or profile warning discards stdout and
 returns `sandbox-unavailable`, even if the process exits 0. A warning is not a
 successful sandbox qualification.
+
+For an accepted response, Gateway returns the model's text as supplied (with the
+existing secret redaction), without rewriting or judging its promises. Grok
+1.0.41 can return "I'll read that file" as ordinary text with `end_turn`, one turn
+and no tool event; the protocol provides no reliable signal to distinguish this
+from a direct answer. The no-tools statement is only a prompt mitigation. It
+cannot identify or reject such promises and does not guarantee their absence.
+Tasks that need file reads, commands or other tool actions should use Grok task
+dispatch following the jieyuexing-universe root `AGENTS.md` section **Grok 任务**,
+instead of Gateway chat.
 
 Calls keep the existing 30 s default / 3600000 ms maximum timeout and 8 MiB stdout
 limit (including event framing); stderr is capped at 64 KiB and never echoed into
