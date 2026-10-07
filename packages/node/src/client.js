@@ -5,7 +5,6 @@ import path from "node:path";
 
 import { opsailPath } from "./binary.js";
 import { OpsailError } from "./errors.js";
-import { parseGatewayResponse } from "./gateway.js";
 
 const PROTOCOL_VERSION = 1;
 const DEFAULT_HARD_TIMEOUT_MS = 30_000;
@@ -58,9 +57,6 @@ export function createOpsail(config = {}) {
   );
 
   return Object.freeze({
-    gateway(request, callOptions = {}) {
-      return gatewayWithConfig(request, callOptions, config.binaryPath, configuredHardTimeoutMs, maxOutputBytes);
-    },
     read(request, callOptions = {}) {
       return readWithConfig(
         request,
@@ -80,30 +76,6 @@ export function createOpsail(config = {}) {
       );
     },
   });
-}
-
-async function gatewayWithConfig(request, callOptions, configuredBinaryPath, configuredHardTimeoutMs, maxOutputBytes) {
-  if (!isRecord(request) || !isRecord(callOptions) || typeof callOptions.passphrase !== "string"
-      || (callOptions.newPassphrase !== undefined && typeof callOptions.newPassphrase !== "string")
-      || (callOptions.dataDir !== undefined && typeof callOptions.dataDir !== "string")) {
-    throw new OpsailError("gateway requires a request and a passphrase in call options", { code: "invalid-request", stage: "input" });
-  }
-  const { signal } = callOptions;
-  if (signal !== undefined && !isAbortSignal(signal)) throw new TypeError("signal must be an AbortSignal");
-  if (signal?.aborted) throw abortedError();
-  let body;
-  try {
-    body = JSON.stringify({ protocolVersion: 1, request, passphrase: callOptions.passphrase,
-      newPassphrase: callOptions.newPassphrase, dataDir: callOptions.dataDir });
-  } catch {
-    throw new OpsailError("gateway input cannot be serialized", { code: "invalid-request", stage: "input" });
-  }
-  if (Buffer.byteLength(body) > 1024 * 1024) {
-    throw new OpsailError("gateway input exceeds the 1 MiB limit", { code: "input-too-large", stage: "input" });
-  }
-  return invokeMachine({ binaryPath: opsailPath({ binaryPath: configuredBinaryPath }), body, signal,
-    hardTimeoutMs: configuredHardTimeoutMs ?? Math.max(60_000, resolveHardTimeoutMs(undefined, request.timeoutMs)),
-    maxOutputBytes, ownsChrome: false, command: "gateway", parseResponse: parseGatewayResponse, privateInput: true });
 }
 
 async function readWithConfig(
@@ -265,7 +237,6 @@ function invokeMachine({
   ownsChrome,
   command = "read",
   parseResponse = parseMachineResponse,
-  privateInput = false,
 }) {
   return invokeProcess({
     binaryPath,
@@ -277,7 +248,6 @@ function invokeMachine({
     ownsChrome,
     parse: parseResponse,
     aborted: abortedError,
-    privateInput,
   });
 }
 
@@ -311,7 +281,6 @@ function invokeProcess({
   ownsChrome,
   parse,
   aborted,
-  privateInput = false,
 }) {
   return new Promise((resolve, reject) => {
     let chromeTempRoot;
@@ -442,7 +411,6 @@ function invokeProcess({
     }
 
     const appendDiagnostic = (chunk) => {
-      if (privateInput) return;
       const remaining = MAX_DIAGNOSTIC_INPUT_BYTES - stderrBytes;
       if (remaining <= 0) return;
       const slice = chunk.subarray(0, remaining);
