@@ -54,9 +54,10 @@ Reports use `schemaVersion: 1` and a `providers` array. Each row has
 `provider` and `status` (`ready` or `unavailable`). Optional numeric fields are
 omitted when unused. The library never returns raw RPC frames or auth material.
 
-Claude adds an optional `windows` array without changing schema version 1.
-Each window has `id`, `remainingPercent`, `usedPercent`, `windowDurationMins`
-and optional `resetsAt` (Unix seconds) and `label` (the readable model name).
+Claude and Codex add an optional `windows` array without changing schema version 1.
+Each window has `id`, `remainingPercent`, `usedPercent`, and optional
+`windowDurationMins`, `resetsAt` (Unix seconds) and `label` (the readable model name).
+Claude always supplies a numeric duration:
 `five_hour` is 300 minutes; `seven_day` and `seven_day_*` are 10080 minutes. Percentages use
 the endpoint's 0–100 units, not fractions. RFC3339 reset offsets are respected.
 Paid extra usage is not a subscription window and is not projected.
@@ -76,8 +77,21 @@ The existing top-level fields mirror `five_hour`, falling back to `seven_day`
 and then the first named weekly window when preceding windows are absent.
 They do not aggregate windows: a weekly/model limit can be exhausted while
 the five-hour window still has capacity. Inspect `windows` for all limits.
-Codex and Grok omit `windows` entirely; Grok projects its current billing period
-into the existing top-level fields.
+Grok omits `windows` entirely and projects its current billing period into the
+existing top-level fields.
+
+Codex projects `primary` and, when present, `secondary` from the same selected
+`codex` bucket in `account/rateLimits/read`. The top-level fields still mirror
+only `primary`; they do not aggregate limits. Window IDs keep the source roles,
+and `windowDurationMins` preserves the reported positive duration, including
+fractional minutes. Neither role implies a five-hour or weekly limit. Missing
+or null durations and reset times are omitted, without guessed values.
+`usedPercent` retains decimals and must be finite and within 0–100;
+`remainingPercent` keeps the legacy rounded integer percentage.
+An absent or null secondary is valid. A present malformed window, percentage,
+duration or reset time makes the entire Codex row unavailable, without projecting
+partial capacity or raw response data. Reset times must be nonnegative integer
+Unix seconds representable by the date-time parser (through year 9999).
 
 ## Grok billing
 

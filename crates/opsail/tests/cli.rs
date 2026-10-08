@@ -1058,16 +1058,20 @@ fn usage_claude_invalid_login_is_unavailable_and_never_prints_credentials() {
 }
 
 #[cfg(unix)]
-#[test]
-fn usage_reads_rate_limits_from_a_fake_codex_cli() {
+fn fake_usage_codex(directory: &std::path::Path, result: serde_json::Value) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
 
-    let directory = tempdir().unwrap();
-    let fake = directory.path().join("codex");
+    let fake = directory.join("codex");
+    fs::write(
+        fake.with_extension("json"),
+        serde_json::to_vec(&result).unwrap(),
+    )
+    .unwrap();
     fs::write(
         &fake,
         r#"#!/usr/bin/env python3
 import json, sys
+from pathlib import Path
 
 def read_frame():
     line = sys.stdin.readline()
@@ -1087,17 +1091,7 @@ request = read_frame()
 assert request["method"] == "account/rateLimits/read"
 write_frame({
     "id": request["id"],
-    "result": {
-        "rateLimits": {
-            "primary": {"usedPercent": 25, "resetsAt": 1786000000, "windowDurationMins": 300}
-        },
-        "rateLimitsByLimitId": {
-            "codex": {
-                "primary": {"usedPercent": 25, "resetsAt": 1786000000, "windowDurationMins": 300},
-                "planType": "plus"
-            }
-        }
-    }
+    "result": json.loads(Path(__file__).with_suffix(".json").read_text())
 })
 "#,
     )
@@ -1105,7 +1099,29 @@ write_frame({
     let mut permissions = fs::metadata(&fake).unwrap().permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&fake, permissions).unwrap();
+    fake
+}
 
+#[cfg(unix)]
+#[test]
+fn usage_reads_rate_limits_from_a_fake_codex_cli() {
+    let directory = tempdir().unwrap();
+    let fake = fake_usage_codex(
+        directory.path(),
+        serde_json::json!({
+            "rateLimits": {
+                "primary": { "usedPercent": 99 },
+                "secondary": { "usedPercent": "ignored-legacy" }
+            },
+            "rateLimitsByLimitId": {
+                "codex": {
+                    "primary": { "usedPercent": 25.25, "resetsAt": 1786000000, "windowDurationMins": 10080 },
+                    "secondary": { "usedPercent": 99.75, "resetsAt": 1786000100, "windowDurationMins": 90.5, "unknown": "private-response-marker" },
+                    "planType": "plus"
+                }
+            }
+        }),
+    );
     let mut command = cargo_bin_cmd!("opsail");
     let assert = command
         .args(["usage", "codex", "--codex-path"])
@@ -1118,8 +1134,110 @@ write_frame({
     assert_eq!(value["providers"][0]["provider"], "codex");
     assert_eq!(value["providers"][0]["status"], "ready");
     assert_eq!(value["providers"][0]["remainingPercent"], 75);
-    assert_eq!(value["providers"][0]["usedPercent"].as_f64(), Some(25.0));
+    assert_eq!(value["providers"][0]["usedPercent"].as_f64(), Some(25.25));
     assert_eq!(value["providers"][0]["planType"], "plus");
+    let entry = &value["providers"][0];
+    assert_eq!(entry["windows"].as_array().unwrap().len(), 2);
+    assert_eq!(entry["windows"][0]["id"], "primary");
+    assert_eq!(entry["windows"][0]["windowDurationMins"], 10080.0);
+    assert_eq!(entry["windows"][1]["id"], "secondary");
+    assert_eq!(entry["windows"][1]["usedPercent"], 99.75);
+    assert_eq!(entry["windows"][1]["remainingPercent"], 0);
+    assert_eq!(entry["windows"][1]["windowDurationMins"], 90.5);
+    assert_eq!(entry["windows"][1]["resetsAt"], 1786000100u64);
+    for field in [
+        "usedPercent",
+        "remainingPercent",
+        "windowDurationMins",
+        "resetsAt",
+    ] {
+        assert_eq!(entry[field], entry["windows"][0][field]);
+    }
+    assert!(!value.to_string().contains("private-response-marker"));
+
+    cargo_bin_cmd!("opsail")
+        .args(["usage", "codex", "--format", "text", "--codex-path"])
+        .arg(&fake)
+        .assert()
+        .success()
+        .stderr("")
+        .stdout("Codex\t75% remaining\tplus\tresets 1786000000\n  primary\t75% remaining\t10080 min\tresets 1786000000\n  secondary\t0% remaining\t90.5 min\tresets 1786000100\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn usage_codex_malformed_secondary_is_unavailable() {
+    let directory = tempdir().unwrap();
+    for secondary in [
+        serde_json::json!({ "usedPercent": "private-response-marker" }),
+        serde_json::json!({ "usedPercent": 101 }),
+        serde_json::json!({ "usedPercent": 10, "windowDurationMins": 0 }),
+        serde_json::json!({ "usedPercent": 10, "resetsAt": -1 }),
+        serde_json::json!([]),
+    ] {
+        let fake = fake_usage_codex(
+            directory.path(),
+            serde_json::json!({ "rateLimits": {
+                "primary": { "usedPercent": 14, "windowDurationMins": 300 },
+                "secondary": secondary
+            }}),
+        );
+        let assert = cargo_bin_cmd!("opsail")
+            .args(["usage", "codex", "--format", "json", "--codex-path"])
+            .arg(&fake)
+            .assert()
+            .success()
+            .stderr("");
+        let value: serde_json::Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
+        assert_eq!(value["schemaVersion"], 1);
+        let entry = &value["providers"][0];
+        assert_eq!(entry["status"], "unavailable");
+        assert!(entry.get("remainingPercent").is_none());
+        assert!(entry.get("windows").is_none());
+        assert!(!value.to_string().contains("private-response-marker"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn usage_codex_missing_or_null_secondary_does_not_invent_a_duration() {
+    let directory = tempdir().unwrap();
+    for bucket in [
+        serde_json::json!({ "primary": { "usedPercent": 14 } }),
+        serde_json::json!({ "primary": { "usedPercent": 14, "windowDurationMins": null, "resetsAt": null }, "secondary": null }),
+    ] {
+        let fake = fake_usage_codex(
+            directory.path(),
+            serde_json::json!({ "rateLimits": bucket }),
+        );
+        let assert = cargo_bin_cmd!("opsail")
+            .args(["usage", "codex", "--format", "json", "--codex-path"])
+            .arg(&fake)
+            .assert()
+            .success()
+            .stderr("");
+        let value: serde_json::Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
+        let entry = &value["providers"][0];
+        assert_eq!(entry["status"], "ready");
+        assert_eq!(entry["windows"].as_array().unwrap().len(), 1);
+        assert_eq!(entry["windows"][0]["id"], "primary");
+        assert_eq!(
+            entry["remainingPercent"],
+            entry["windows"][0]["remainingPercent"]
+        );
+        assert_eq!(entry["usedPercent"], entry["windows"][0]["usedPercent"]);
+        for value in [entry, &entry["windows"][0]] {
+            assert!(value.get("windowDurationMins").is_none());
+            assert!(value.get("resetsAt").is_none());
+        }
+        cargo_bin_cmd!("opsail")
+            .args(["usage", "codex", "--format", "text", "--codex-path"])
+            .arg(&fake)
+            .assert()
+            .success()
+            .stderr("")
+            .stdout("Codex\t86% remaining\n  primary\t86% remaining\n");
+    }
 }
 
 #[cfg(windows)]

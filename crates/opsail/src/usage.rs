@@ -112,9 +112,12 @@ fn format_entry(entry: &UsageEntry) -> String {
             if let Some(windows) = &entry.windows {
                 for window in windows {
                     line.push_str(&format!(
-                        "\n  {}\t{}% remaining\t{} min",
-                        window.id, window.remaining_percent, window.window_duration_mins
+                        "\n  {}\t{}% remaining",
+                        window.id, window.remaining_percent
                     ));
+                    if let Some(duration) = window.window_duration_mins {
+                        line.push_str(&format!("\t{duration} min"));
+                    }
                     if let Some(resets_at) = window.resets_at {
                         line.push_str(&format!("\tresets {resets_at}"));
                     }

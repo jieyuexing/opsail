@@ -279,7 +279,7 @@ fn parse_usage(bytes: &[u8], plan_type: Option<String>) -> Result<UsageEntry, &'
         remaining_percent: Some(primary.remaining_percent),
         used_percent: Some(primary.used_percent),
         resets_at: primary.resets_at,
-        window_duration_mins: Some(primary.window_duration_mins),
+        window_duration_mins: primary.window_duration_mins,
         plan_type,
         reset_credit_available_count: None,
         reset_credit_expires_at: None,
@@ -383,7 +383,7 @@ fn parse_window(
         remaining_percent: (100.0 - used).round() as u8,
         used_percent: used,
         resets_at,
-        window_duration_mins: duration,
+        window_duration_mins: Some(duration),
     })
 }
 
@@ -571,7 +571,7 @@ mod tests {
                 "seven_day_sonnet"
             ]
         );
-        assert_eq!(windows[1].window_duration_mins, 10_080.0);
+        assert_eq!(windows[1].window_duration_mins, Some(10_080.0));
         assert_eq!(windows[1].resets_at, windows[2].resets_at);
         assert_eq!(windows[3].resets_at, None);
         assert!(windows.iter().all(|window| window.label.is_none()));
