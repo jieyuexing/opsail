@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "Opsail Chrome",
+  "version": "0.1.0",
+  "minimum_chrome_version": "120",
+  "description": "Read bound Feishu and Teams sources through local Opsail scripts.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA67lEaepPJZ/TiiQ+NLWh5yeUhrJI6EWpPcLhZiUlk2tqpyVgsJ/6O4kuiZ6abEFYYhVsSsXqOnnK1lfsm57jGaikfH/griitowKBufhifwHSP5gbQIlnDlekAmM2uSaour5DSb/cSnJk/YwhrH/3qYpZsmOYfHxeIofADhh1YVsSJxhjw/Co3XFiN+D9Zl5buMSvvk1doo0fD1nE6h+uG67/tBpm1SVa9uPz1/kd8qokXIuXkBl0Z7b0Se5oPHyPo7cAmJ8f4FH6377rUNlrd61UQ3YLeGSoASHj9rJ6/I3tOufUlEJtnaDU7aNwOmFHBAvo5FdwCRB6yGUcleRvQQIDAQAB",
+  "permissions": ["nativeMessaging", "storage", "scripting", "alarms"],
+  "optional_host_permissions": ["https://*.feishu.cn/*", "https://teams.microsoft.com/*", "https://teams.microsoftonline.cn/*", "https://teams.cloud.microsoft/*"],
+  "background": {"service_worker": "worker.js", "type": "module"},
+  "action": {"default_title": "Opsail Chrome", "default_popup": "options.html"},
+  "options_page": "options.html",
+  "content_security_policy": {"extension_pages": "script-src 'self'; object-src 'none'"}
+}

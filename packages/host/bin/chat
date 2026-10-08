@@ -1,0 +1,28 @@
+#!/bin/sh
+# Single chat entry. Each subcommand keeps its existing implementation and contract.
+set -eu
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+python=${OPSAIL_CHAT_PYTHON:-python3}
+usage() {
+  cat <<'USAGE'
+Usage: chat <command> [options]
+
+  status | check | catalog | read   只读：状态、检查、会话目录、单会话读取
+  prepare | select                  操作浏览器：打开绑定页 / 点击选中会话（选中=打开会话，会清未读）
+  sync --since D [--provider P] [--conversation-id ID]  飞书/Teams：逐会话选中后补到 D（飞书页面 SDK 翻页，Teams 向上滚动后回到底部），按消息 ID 累积；D 至昨天已覆盖的会话跳过
+  collect [--provider P|all]        飞书/Teams 采集侧栏会话可见窗口（会 select）；微信只读 snapshot 增量采集，按消息 ID 累积到配置的数据目录
+  digest --date D [--export]        生成某日 index.json、刷新 INDEX.md；--export 输出当日消息
+  run                               定时入口：安全重启检查 → 飞书/Teams collect + sync 到昨天 → 按 daily.json.wechatSync 刷新微信快照 → 微信 snapshot 增量采集 → 三家索引昨天与今天 → 本机通知
+
+Bridge administration stays in opsail-chrome (install/doctor/bind/qualify/prune-runtime).
+USAGE
+}
+[ $# -gt 0 ] || { usage >&2; exit 2; }
+command=$1; shift
+case "$command" in
+  status|check|catalog|read) exec node "$script_dir/../src/chat/command.js" "$command" "$@" ;;
+  prepare|select) exec "$python" "$script_dir/../src/chat/browser.py" "$command" "$@" ;;
+  collect|sync|digest|run) exec "$python" "$script_dir/../src/chat/daily.py" "$command" "$@" ;;
+  -h|--help|help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac

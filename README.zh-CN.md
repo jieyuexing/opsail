@@ -1,3 +1,9 @@
+# Opsail Host
+
+此仓库是 [lencx/opsail](https://github.com/lencx/opsail) 的独立维护 fork，地址为 [jieyuexing/opsail-host](https://github.com/jieyuexing/opsail-host)。保留原 Rust CLI 名 `opsail` 与上游许可/历史，新增 [packages/host](packages/host/README.md) 承载公开 MCP、聊天采集和浏览器核心。公司适配与账号数据不进入本仓。T3 按独立 MCP App 路线接入，首张 UI 卡片尚未实现。
+
+当前使用源码构建；本轮未发布新的 npm/crates.io 包或 GitHub release。下面原生能力与上游分发说明保留供参考，上游安装命令不包含本 fork 新增的 Host 包。
+
 <p align="center">
   <img src="https://raw.githubusercontent.com/lencx/opsail/main/assets/opsail-logo.png" alt="Opsail 标志" width="160">
 </p>

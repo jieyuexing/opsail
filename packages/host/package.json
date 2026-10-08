@@ -1,0 +1,35 @@
+{
+  "name": "@jieyuexing/opsail-host",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "description": "Independent Opsail MCP and chat core; instance integrations are external.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jieyuexing/opsail-host.git",
+    "directory": "packages/host"
+  },
+  "exports": {
+    ".": "./src/index.js",
+    "./mcp": "./src/mcp-server.js",
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "opsail-host-mcp": "./src/mcp-server.js",
+    "opsail-chat": "./bin/chat",
+    "opsail-chrome": "./bin/opsail-chrome"
+  },
+  "files": [
+    "src",
+    "bin",
+    "pin.json",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

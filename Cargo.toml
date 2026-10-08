@@ -15,7 +15,7 @@ rust-version = "1.97"
 license = "Apache-2.0"
 authors = ["lencx <lencx.me@gmail.com>"]
 readme = "README.md"
-repository = "https://github.com/lencx/opsail"
+repository = "https://github.com/jieyuexing/opsail-host"
 
 [workspace.dependencies]
 ammonia = "4.1.3"

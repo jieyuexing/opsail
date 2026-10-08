@@ -1,3 +1,9 @@
+# Opsail Host
+
+This is the maintained [jieyuexing/opsail-host](https://github.com/jieyuexing/opsail-host) fork of [lencx/opsail](https://github.com/lencx/opsail). It retains the `opsail` native CLI name, upstream history, and license. [packages/host](packages/host/README.md) owns the public MCP, chat collection, and browser core. Company adapters and account data remain outside this repository. T3 integration follows the independent MCP Apps route; the first UI card is a later stage.
+
+Use the source checkout for this fork. No new npm/crates.io package or GitHub release accompanies this split. The native capability and upstream distribution documentation below is retained for reference; upstream install commands do not include this fork's Host package.
+
 <p align="center">
   <img src="https://raw.githubusercontent.com/lencx/opsail/main/assets/opsail-logo.png" alt="Opsail logo" width="160">
 </p>

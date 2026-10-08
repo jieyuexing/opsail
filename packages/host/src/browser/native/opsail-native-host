@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec "${OPSAIL_CHROME_NODE:-node}" "$script_dir/native-host.mjs" "$@"

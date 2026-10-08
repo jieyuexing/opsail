@@ -26,14 +26,14 @@ from typing import Any
 
 
 SCHEMA = 1
-ROOT = Path(__file__).resolve().parents[6]
-REAL_SOURCE = ROOT / ".local/opsail-xlsx/20260908-native-acceptance/source.xlsx"
-REAL_AFTER = ROOT / ".local/opsail-xlsx/20260908-native-acceptance/candidate.xlsx"
 MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 CT = "http://schemas.openxmlformats.org/package/2006/content-types"
 PKGREL = "http://schemas.openxmlformats.org/package/2006/relationships"
 LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+SYNTHETIC = [("tall", 5000, 4, 2), ("wide", 50, 400, 2), ("styles", 2000, 10, 512)]
+KINDS = {"inspect", "diff", "patch"}
+FILE_FIELDS = ("source", "before", "after")
 
 
 def die(message: str) -> None:
@@ -164,7 +164,7 @@ def base_request(operation: str) -> dict[str, Any]:
 
 def source_request(case: dict[str, Any], inputs: Path, output: Path | None = None) -> dict[str, Any]:
     request = copy.deepcopy(case["request"])
-    for field in ("source", "before", "after"):
+    for field in FILE_FIELDS:
         if field in request:
             request[field] = str((inputs / case["inputDir"] / request[field]).resolve())
     if output is not None:
@@ -191,40 +191,78 @@ def fixture_cases(name: str, rows: int, columns: int) -> list[dict[str, Any]]:
     ]
 
 
-def build_manifest(bench: Path, real_source: Path, real_after: Path) -> dict[str, Any]:
+def validate_extras(extras: list[dict[str, Any]]) -> None:
+    """Reject an external case definition before anything is copied.
+
+    Each definition is ``{"name", "files": {"<name>.xlsx": "/absolute/file"},
+    "cases": [...]}``; cases use the same shape as the synthetic ones and may
+    reference only their own copied files.
+    """
+    if not isinstance(extras, list):
+        die("case definitions must be a list")
+    names = {name for name, *_ in SYNTHETIC}
+    ids = {case["id"] for name, rows, columns, _ in SYNTHETIC for case in fixture_cases(name, rows, columns)}
+    for extra in extras:
+        if not isinstance(extra, dict) or set(extra) != {"name", "files", "cases"}:
+            die("case definition needs exactly name, files and cases")
+        name, files, cases = extra["name"], extra["files"], extra["cases"]
+        if not isinstance(name, str) or not LABEL.fullmatch(name) or name in names:
+            die(f"case definition name is invalid or already used: {name}")
+        names.add(name)
+        if not isinstance(files, dict) or not files:
+            die(f"{name}: files must name at least one input")
+        for filename, source in files.items():
+            if not LABEL.fullmatch(filename) or not filename.endswith(".xlsx"):
+                die(f"{name}: input name must be a plain .xlsx file name: {filename}")
+            if not isinstance(source, str) or not absolute(source).is_file():
+                die(f"{name}: input must be a readable file: {source}")
+        if not isinstance(cases, list) or not cases:
+            die(f"{name}: cases must not be empty")
+        for case in cases:
+            if not isinstance(case, dict) or set(case) != {"id", "kind", "inputDir", "request"}:
+                die(f"{name}: case needs exactly id, kind, inputDir and request")
+            identifier, kind, request = case["id"], case["kind"], case["request"]
+            if not isinstance(identifier, str) or not LABEL.fullmatch(identifier) or identifier in ids:
+                die(f"{name}: case id is invalid or duplicated: {identifier}")
+            ids.add(identifier)
+            if kind not in KINDS or case["inputDir"] != name:
+                die(f"{identifier}: kind must be inspect, diff or patch and inputDir must be {name}")
+            if not isinstance(request, dict) or request.get("operation") != kind:
+                die(f"{identifier}: request operation must match kind")
+            for field in FILE_FIELDS:
+                if field in request and request[field] not in files:
+                    die(f"{identifier}: request {field} must be one of {sorted(files)}")
+            if kind == "patch" and "source" not in request:
+                die(f"{identifier}: patch request needs source")
+
+
+def build_manifest(bench: Path, extras: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    extras = extras or []
+    validate_extras(extras)
     inputs = bench / "inputs"
     inputs.mkdir(parents=True, exist_ok=False)
-    real = inputs / "uc"
-    real.mkdir()
-    shutil.copyfile(real_source, real / "source.xlsx")
-    shutil.copyfile(real_after, real / "after.xlsx")
-    cases: list[dict[str, Any]] = [
-        {"id": "uc-inspect", "kind": "inspect", "inputDir": "uc", "request": {**base_request("inspect"), "source": "source.xlsx", "ranges": ["UseCase!E12:F14"], "maxCells": 200}},
-        {"id": "uc-diff", "kind": "diff", "inputDir": "uc", "request": {**base_request("diff"), "before": "source.xlsx", "after": "after.xlsx", "maxCells": 20}},
-        {"id": "uc-patch", "kind": "patch", "inputDir": "uc", "request": {**base_request("patch"), "source": "source.xlsx", "output": "__BENCH_OUTPUT__", "operations": [
-            {"op": "setText", "sheet": "UseCase", "cell": "E12", "expectedText": "HHT requires request.UUID and:", "value": "HHT requires request.UUID and: [Opsail verification copy]"},
-            {"op": "setStyle", "sheet": "UseCase", "range": "F13", "style": {"fontColor": "0000FF", "wrapText": True, "vertical": "top", "horizontal": "left"}},
-            {"op": "copyStyle", "sheet": "UseCase", "range": "F14", "fromCell": "F13", "components": ["alignment"]},
-            {"op": "rowHeight", "sheet": "UseCase", "row": 14, "height": 32},
-            {"op": "columnWidth", "sheet": "Mapping List", "column": "N", "width": 20},
-            {"op": "rowVisibility", "sheet": "UseCase", "row": 15, "hidden": False},
-            {"op": "setStyle", "sheet": "gwhCtet1Rpspl01Prt(api)", "range": "AT41", "style": {"wrapText": True, "vertical": "top"}},
-        ]}},
-    ]
-    definitions = [("tall", 5000, 4, 2), ("wide", 50, 400, 2), ("styles", 2000, 10, 512)]
-    for name, rows, columns, fonts in definitions:
+    cases: list[dict[str, Any]] = []
+    for extra in extras:
+        target = inputs / extra["name"]
+        target.mkdir()
+        for filename, source in extra["files"].items():
+            shutil.copyfile(source, target / filename)
+        cases.extend(copy.deepcopy(extra["cases"]))
+    for name, rows, columns, fonts in SYNTHETIC:
         target = inputs / name
         target.mkdir()
         synthetic_book(target / "source.xlsx", rows, columns, "before", fonts)
         synthetic_book(target / "after.xlsx", rows, columns, "after", fonts)
         cases.extend(fixture_cases(name, rows, columns))
+    names = [extra["name"] for extra in extras] + [name for name, *_ in SYNTHETIC]
     manifest = {
         "schemaVersion": 1,
         "createdBy": "opsail-xlsx benchmark.py",
-        "realInputs": {"source": str(real_source), "after": str(real_after)},
-        "fixtures": {name: {file.name: digest(file) for file in sorted((inputs / name).glob("*.xlsx"))} for name in ("uc", "tall", "wide", "styles")},
+        "fixtures": {name: {file.name: digest(file) for file in sorted((inputs / name).glob("*.xlsx"))} for name in names},
         "cases": cases,
     }
+    if extras:
+        manifest["externalInputs"] = {extra["name"]: dict(extra["files"]) for extra in extras}
     json_write(bench / "manifest.json", manifest)
     return manifest
 
@@ -239,23 +277,22 @@ def verify_manifest(bench: Path, manifest: dict[str, Any]) -> None:
                 die(f"fixture changed or missing: {path}")
 
 
-def prepare(args: argparse.Namespace) -> None:
-    bench = absolute(args.dir)
-    source = absolute(args.real_source)
-    after = absolute(args.real_after)
-    if not source.is_file() or not after.is_file():
-        die("--real-source and --real-after must be readable files")
+def prepare_dir(bench: Path, extras: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Create a new benchmark directory, or hash-verify and reuse an existing one."""
     manifest_file = bench / "manifest.json"
     if manifest_file.exists():
         manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
         verify_manifest(bench, manifest)
-        print(json.dumps({"status": "reused", "manifest": str(manifest_file), "cases": len(manifest["cases"])}, ensure_ascii=False))
-        return
+        return {"status": "reused", "manifest": str(manifest_file), "cases": len(manifest["cases"])}
     if bench.exists() and any(bench.iterdir()):
         die(f"new benchmark directory must be empty: {bench}")
-    bench.mkdir(parents=True, exist_ok=True)
-    manifest = build_manifest(bench, source, after)
-    print(json.dumps({"status": "prepared", "manifest": str(manifest_file), "cases": len(manifest["cases"])}, ensure_ascii=False))
+    manifest = build_manifest(bench, extras)
+    return {"status": "prepared", "manifest": str(manifest_file), "cases": len(manifest["cases"])}
+
+
+def prepare(args: argparse.Namespace) -> None:
+    extras = json.loads(absolute(args.cases).read_text(encoding="utf-8")) if args.cases else None
+    print(json.dumps(prepare_dir(absolute(args.dir), extras), ensure_ascii=False))
 
 
 def run_one(binary: Path, request: dict[str, Any], timeout: float) -> dict[str, Any]:
@@ -479,8 +516,7 @@ def parser() -> argparse.ArgumentParser:
     commands = p.add_subparsers(dest="command", required=True)
     prepare_parser = commands.add_parser("prepare", help="create or hash-verify fixed benchmark inputs")
     prepare_parser.add_argument("--dir", required=True)
-    prepare_parser.add_argument("--real-source", default=str(REAL_SOURCE))
-    prepare_parser.add_argument("--real-after", default=str(REAL_AFTER))
+    prepare_parser.add_argument("--cases", help="absolute JSON file with optional external case definitions")
     prepare_parser.set_defaults(func=prepare)
     run_parser = commands.add_parser("run", help="measure one binary with fresh processes")
     run_parser.add_argument("--dir", required=True)

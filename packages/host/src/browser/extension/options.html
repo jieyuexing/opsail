@@ -1,0 +1,9 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Opsail Chrome</title><link rel="stylesheet" href="options.css">
+<main><h1>Opsail Chrome</h1><p>通过本机 CLI 读取已绑定的信息源。</p>
+<dl><dt>本机连接</dt><dd id="connection">检查中</dd><dt>Chrome 实例</dt><dd id="profile">—</dd><dt>运行状态</dt><dd id="state">—</dd></dl>
+<section><h2>来源权限</h2><p>先运行 <code>opsail-chrome bind</code> 配置来源，再在这里授予对应站点权限。</p><div id="sources"></div></section>
+<section class="actions"><button id="pause">暂停读取</button><button id="reconnect">重新连接</button></section>
+<p id="notice" role="status"></p><p class="fine">消息通过本机 Opsail 保存。此扩展不发送消息；关闭或卸载扩展不会删除留存包。</p></main>
+<script type="module" src="options.js"></script></html>

@@ -339,13 +339,18 @@ an independent XML parser and compares unmodified compressed ZIP payloads.
 
 Use [scripts/benchmark.py](scripts/benchmark.py) to prepare immutable inputs,
 measure saved baseline and candidate binaries, and compare their results. See
-[the benchmark protocol](scripts/README.md) for exact commands. The fixed suite
-covers a real UC copy and 20,000-cell tall, wide and 512-style workbooks; patch
-stress cases select 10,000 targets. Each case records a separate warm-up and
+[the benchmark protocol](scripts/README.md) for exact commands. The default suite
+is synthetic only: 20,000-cell tall, wide and 512-style workbooks; patch stress
+cases select 10,000 targets. `prepare --cases /absolute/cases.json` (or the
+`prepare_dir` function) adds explicitly supplied workbooks and case definitions,
+copied into the benchmark directory; there is no default real input, and
+existing manifests and results keep working with `run` and `compare`. Each case
+records a separate warm-up and
 three fresh-process samples, input/binary SHA-256, failures and timeouts. Compare
 requires identical inspect/diff responses and all candidate ZIP payloads, not
 merely matching timings. Use `python3 scripts/test_benchmark.py` to check that
-response differences, candidate differences and timeouts invalidate a speedup.
+response differences, candidate differences and timeouts invalidate a speedup,
+and that invalid external case definitions are rejected before anything is copied.
 
 Row/cell indexes are local to each loaded worksheet and refer to physical XML
 child positions. Creating missing rows/cells shifts the affected indexes before
