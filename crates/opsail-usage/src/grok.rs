@@ -310,6 +310,7 @@ async fn query_browser_billing(
         plan_type: Some("grok-build".to_owned()),
         reset_credit_available_count: None,
         reset_credit_expires_at: None,
+        reset_credits: None,
         windows: None,
     })
 }
@@ -458,6 +459,7 @@ fn parse_cli_billing_payload(bytes: &[u8]) -> Option<UsageSnapshot> {
         plan_type,
         reset_credit_available_count: None,
         reset_credit_expires_at: None,
+        reset_credits: None,
         windows: None,
     })
 }

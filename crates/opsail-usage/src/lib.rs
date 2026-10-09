@@ -15,7 +15,7 @@ mod rpc;
 
 pub use error::{UsageError, UsageErrorCode};
 pub use model::{
-    ClientInfo, DEFAULT_TIMEOUT, SCHEMA_VERSION, UsageEntry, UsageOptions, UsageProvider,
+    ClientInfo, DEFAULT_TIMEOUT, SCHEMA_VERSION, ResetCredit, UsageEntry, UsageOptions, UsageProvider,
     UsageReport, UsageSnapshot, UsageStatus, UsageWindow,
 };
 pub use query::read_usage;

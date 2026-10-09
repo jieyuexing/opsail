@@ -36,9 +36,12 @@ export function normalizeClaudeUsage(input) {
   if (!object(input)) invalid('需要对象')
   const entry = object(input.plan) ? input.plan : input
   if (!['ok', 'ready', 'unavailable', 'not_applicable'].includes(entry.status)) invalid('status')
+  const resetFields = entry.unparsedResetFields
+  if (resetFields != null && (!Array.isArray(resetFields) || !resetFields.every(field => typeof field === 'string'))) invalid('unparsedResetFields')
+  const resetProjection = resetFields == null ? {} : { unparsedResetFields: [...resetFields] }
   if (entry.status === 'unavailable' || entry.status === 'not_applicable') {
     return {
-      status: entry.status, remainingPercent: null, windows: [],
+      status: entry.status, remainingPercent: null, windows: [], ...resetProjection,
       detail: typeof entry.detail === 'string' ? entry.detail : `Claude 额度状态为 ${entry.status}。`,
     }
   }
@@ -87,7 +90,7 @@ export function normalizeClaudeUsage(input) {
   const primary = windows.find(window => window.id === 'five_hour')
     ?? windows.find(window => window.id === 'seven_day') ?? windows[0]
   return {
-    status: 'ready', remainingPercent: primary?.remainingPercent ?? null,
+    status: 'ready', remainingPercent: primary?.remainingPercent ?? null, ...resetProjection,
     usedPercent: primary?.usedPercent ?? null, resetsAt: primary?.resetsAt ?? null,
     windowDurationMins: primary?.windowDurationMins ?? null,
     planType: typeof entry.plan === 'string' ? entry.plan : typeof entry.planType === 'string' ? entry.planType : null,

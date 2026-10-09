@@ -273,6 +273,11 @@ fn parse_usage(bytes: &[u8], plan_type: Option<String>) -> Result<UsageEntry, &'
         .or_else(|| windows.iter().find(|window| window.id == "seven_day"))
         .or_else(|| windows.first())
         .ok_or(INVALID_RESPONSE)?;
+    let unparsed_reset_fields: Vec<String> = ["juniper_tide", "cedar_ember"]
+        .into_iter()
+        .filter(|field| object.get(*field).is_some_and(|value| !value.is_null()))
+        .map(str::to_owned)
+        .collect();
     Ok(UsageEntry {
         provider: UsageProvider::Claude,
         status: UsageStatus::Ready,
@@ -283,6 +288,12 @@ fn parse_usage(bytes: &[u8], plan_type: Option<String>) -> Result<UsageEntry, &'
         plan_type,
         reset_credit_available_count: None,
         reset_credit_expires_at: None,
+        reset_credits: None,
+        unparsed_reset_fields: if unparsed_reset_fields.is_empty() {
+            None
+        } else {
+            Some(unparsed_reset_fields)
+        },
         detail: None,
         windows: Some(windows),
     })
@@ -439,6 +450,37 @@ mod tests {
             "member_dashboard_available": false,
             "seven_day_breakdown": {"as_of": "2026-09-24T01:00:00.000000+00:00", "window_started_at": "2026-09-17T11:00:00.000000+00:00", "rows": [{"key": "claude_code", "display_name": "Claude Code", "percent": 100}]}
         })
+    }
+
+    #[test]
+    fn unparsed_reset_fields_only_report_non_null_names() {
+        for (extra, expected) in [
+            (serde_json::json!({}), serde_json::Value::Null),
+            (
+                serde_json::json!({"juniper_tide": null, "cedar_ember": null}),
+                serde_json::Value::Null,
+            ),
+            (
+                serde_json::json!({"juniper_tide": {"secret": "private-marker"}, "cedar_ember": false}),
+                serde_json::json!(["juniper_tide", "cedar_ember"]),
+            ),
+            (
+                serde_json::json!({"cedar_ember": []}),
+                serde_json::json!(["cedar_ember"]),
+            ),
+        ] {
+            let mut root = serde_json::json!({"five_hour": {"utilization": 20}});
+            root.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let entry = parse_usage(&serde_json::to_vec(&root).unwrap(), None).unwrap();
+            let encoded = serde_json::to_value(entry).unwrap();
+            assert_eq!(encoded["unparsedResetFields"], expected);
+            assert!(!encoded.to_string().contains("private-marker"));
+            if expected.is_null() {
+                assert!(encoded.get("unparsedResetFields").is_none());
+            }
+        }
     }
 
     #[test]

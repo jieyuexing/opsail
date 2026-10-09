@@ -71,7 +71,10 @@ are ignored. `percent` is the used percentage; `is_active` does not filter windo
 When `limits` is absent or empty, only the legacy `five_hour`, `seven_day`
 and named `seven_day_*` objects with numeric `utilization` become windows.
 Missing/null utilization (including `seven_day_breakdown`) is skipped;
-other nonnumeric utilization is rejected. Unrelated code-name keys are ignored.
+other nonnumeric utilization is rejected. Non-null top-level `juniper_tide` and
+`cedar_ember` are reported only as names in `unparsedResetFields`; their contents
+are never projected or interpreted. Null or absent fields omit this extension.
+Other unrelated code-name keys are ignored.
 
 The existing top-level fields mirror `five_hour`, falling back to `seven_day`
 and then the first named weekly window when preceding windows are absent.
@@ -92,6 +95,23 @@ An absent or null secondary is valid. A present malformed window, percentage,
 duration or reset time makes the entire Codex row unavailable, without projecting
 partial capacity or raw response data. Reset times must be nonnegative integer
 Unix seconds representable by the date-time parser (through year 9999).
+
+## Reset credits
+
+Codex adds optional `resetCredits`, sorted by `expiresAt`. Each card contains only
+`status`, `resetType`, `grantedAt` and `expiresAt` (integer Unix seconds). Opaque
+IDs, titles and descriptions are excluded. A missing/null `rateLimitResetCredits`
+or a malformed card/list omits the array (unknown), without invalidating usage
+windows or the ready row. An empty valid list is `[]`, with
+`resetCreditAvailableCount: 0`; zero is distinct from an omitted unknown count.
+The legacy `resetCreditAvailableCount` preserves a nonnegative integer count,
+and `resetCreditExpiresAt` is the earliest expiry among cards marked `available`.
+The summary is independent of complete card validity; consumers must validate
+count/list consistency before using cards for decisions.
+
+Text output includes the Codex reset-card summary and each projected card. Claude
+text output lists any `unparsedResetFields` names. Grok gains no report fields.
+This library only reads cards; it does not redeem them or add capacity to windows.
 
 ## Grok billing
 

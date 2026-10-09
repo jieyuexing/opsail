@@ -129,6 +129,17 @@ pub struct UsageSnapshot {
     pub reset_credit_available_count: Option<u64>,
     pub reset_credit_expires_at: Option<u64>,
     pub windows: Option<Vec<UsageWindow>>,
+    pub reset_credits: Option<Vec<ResetCredit>>,
+}
+
+/// Credential-free reset card; opaque identifiers and display content are never projected.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResetCredit {
+    pub status: String,
+    pub reset_type: String,
+    pub granted_at: u64,
+    pub expires_at: u64,
 }
 
 /// One named subscription window. Reset times use Unix seconds, like the legacy fields.
@@ -169,6 +180,10 @@ pub struct UsageEntry {
     pub reset_credit_expires_at: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset_credits: Option<Vec<ResetCredit>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unparsed_reset_fields: Option<Vec<String>>,
     /// Optional multi-window extension to schema version 1. Legacy providers omit it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub windows: Option<Vec<UsageWindow>>,
@@ -187,6 +202,8 @@ impl UsageEntry {
             reset_credit_available_count: snapshot.reset_credit_available_count,
             reset_credit_expires_at: snapshot.reset_credit_expires_at,
             detail: None,
+            reset_credits: snapshot.reset_credits,
+            unparsed_reset_fields: None,
             windows: snapshot.windows,
         }
     }
@@ -203,6 +220,8 @@ impl UsageEntry {
             reset_credit_available_count: snapshot.reset_credit_available_count,
             reset_credit_expires_at: snapshot.reset_credit_expires_at,
             detail: None,
+            reset_credits: None,
+            unparsed_reset_fields: None,
             windows: None,
         }
     }
@@ -218,6 +237,8 @@ impl UsageEntry {
             plan_type: None,
             reset_credit_available_count: None,
             reset_credit_expires_at: None,
+            reset_credits: None,
+            unparsed_reset_fields: None,
             detail: Some(detail.into()),
             windows: None,
         }
@@ -244,25 +265,47 @@ pub(crate) fn snapshot_from_rate_limits(value: &Value) -> Result<UsageSnapshot, 
         None | Some(Value::Null) => {}
         Some(secondary) => windows.push(codex_window("secondary", secondary)?),
     }
-    let reset_credits = value.get("rateLimitResetCredits");
-    let reset_credit_available_count = reset_credits
-        .and_then(|credits| finite_number(credits.get("availableCount")))
-        .map(|count| count.max(0.0).floor() as u64)
-        .filter(|count| *count > 0);
-    let reset_credit_expires_at = reset_credit_available_count.and_then(|_| {
-        reset_credits
-            .and_then(|credits| credits.get("credits"))
-            .and_then(Value::as_array)
-            .and_then(|credits| {
-                credits
-                    .iter()
-                    .filter(|credit| {
-                        credit.get("status").and_then(Value::as_str) == Some("available")
+    let credit_info = value.get("rateLimitResetCredits");
+    let reset_credits = credit_info
+        .and_then(|info| info.get("credits"))
+        .and_then(Value::as_array)
+        .and_then(|credits| {
+            credits
+                .iter()
+                .map(|credit| {
+                    Some(ResetCredit {
+                        status: credit.get("status")?.as_str()?.to_owned(),
+                        reset_type: credit.get("resetType")?.as_str()?.to_owned(),
+                        granted_at: credit.get("grantedAt")?.as_u64()?,
+                        expires_at: credit.get("expiresAt")?.as_u64()?,
                     })
-                    .filter_map(|credit| json_u64(credit.get("expiresAt")))
-                    .min()
-            })
-    });
+                })
+                .collect::<Option<Vec<_>>>()
+        })
+        .map(|mut credits| {
+            credits.sort_by_key(|credit| credit.expires_at);
+            credits
+        });
+    let reset_credit_available_count = credit_info
+        .and_then(|info| info.get("availableCount"))
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            reset_credits
+                .as_ref()
+                .filter(|credits| credits.is_empty())
+                .map(|_| 0)
+        });
+    // Keep the legacy summary independent of the complete per-card projection.
+    let reset_credit_expires_at = credit_info
+        .and_then(|info| info.get("credits"))
+        .and_then(Value::as_array)
+        .and_then(|credits| {
+            credits
+                .iter()
+                .filter(|credit| credit.get("status").and_then(Value::as_str) == Some("available"))
+                .filter_map(|credit| credit.get("expiresAt").and_then(Value::as_u64))
+                .min()
+        });
 
     Ok(UsageSnapshot {
         remaining_percent: primary.remaining_percent,
@@ -276,6 +319,7 @@ pub(crate) fn snapshot_from_rate_limits(value: &Value) -> Result<UsageSnapshot, 
             .map(ToOwned::to_owned),
         reset_credit_available_count,
         reset_credit_expires_at,
+        reset_credits,
         windows: Some(windows),
     })
 }
@@ -335,21 +379,60 @@ fn finite_number(value: Option<&Value>) -> Option<f64> {
         .filter(|number| number.is_finite())
 }
 
-fn json_u64(value: Option<&Value>) -> Option<u64> {
-    let value = value?;
-    value.as_u64().or_else(|| {
-        finite_number(Some(value))
-            .filter(|number| *number > 0.0)
-            .map(|number| number as u64)
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::{UsageProvider, snapshot_from_rate_limits};
     use crate::UsageErrorCode;
+
+    #[test]
+    fn reset_credits_are_sorted_private_and_independent_of_windows() {
+        let base = json!({"rateLimits": {"primary": {"usedPercent": 10}}});
+        let card = json!({"status": "available", "resetType": "codexRateLimits",
+            "grantedAt": 100, "expiresAt": 300, "id": "private-marker",
+            "title": "private-marker", "description": "private-marker"});
+        let mut value = base.clone();
+        let mut earlier = card.clone();
+        earlier["expiresAt"] = json!(200);
+        value["rateLimitResetCredits"] =
+            json!({"availableCount": 2, "credits": [card.clone(), earlier]});
+        let encode = |v: &serde_json::Value| {
+            serde_json::to_value(super::UsageEntry::from_codex(
+                snapshot_from_rate_limits(v).unwrap(),
+            ))
+            .unwrap()
+        };
+        let encoded = encode(&value);
+        assert_eq!(encoded["resetCredits"][0]["expiresAt"], 200);
+        assert_eq!(encoded["resetCredits"][1]["expiresAt"], 300);
+        assert_eq!(encoded["resetCredits"][0].as_object().unwrap().len(), 4);
+        assert!(!encoded.to_string().contains("private-marker"));
+        for field in ["status", "resetType", "grantedAt", "expiresAt"] {
+            for bad in [serde_json::Value::Null, json!({}), json!([]), json!(false)] {
+                let mut malformed = card.clone();
+                malformed[field] = bad;
+                value["rateLimitResetCredits"]["credits"] = json!([card, malformed]);
+                let encoded = encode(&value);
+                assert!(encoded.get("resetCredits").is_none());
+                assert_eq!(encoded["status"], "ready");
+                assert_eq!(encoded["remainingPercent"], 90);
+            }
+            let mut missing = card.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            value["rateLimitResetCredits"]["credits"] = json!([missing]);
+            assert!(encode(&value).get("resetCredits").is_none());
+        }
+        for v in [base.clone(), {
+            let mut v = base;
+            v["rateLimitResetCredits"] = serde_json::Value::Null;
+            v
+        }] {
+            let encoded = encode(&v);
+            assert!(encoded.get("resetCredits").is_none());
+            assert!(encoded.get("resetCreditAvailableCount").is_none());
+        }
+    }
 
     #[test]
     fn malformed_secondary_is_not_a_ready_primary_only_snapshot() {
@@ -411,13 +494,16 @@ mod tests {
     }
 
     #[test]
-    fn omits_empty_reset_credits() {
+    fn preserves_zero_reset_credits() {
         let empty_credits = snapshot_from_rate_limits(&json!({
             "rateLimits": { "primary": { "usedPercent": 10 } },
             "rateLimitResetCredits": { "availableCount": 0, "credits": [] }
         }))
         .unwrap();
-        assert_eq!(empty_credits.reset_credit_available_count, None);
+        assert_eq!(empty_credits.reset_credit_available_count, Some(0));
+        let encoded =
+            serde_json::to_value(super::UsageEntry::from_codex(empty_credits.clone())).unwrap();
+        assert_eq!(encoded["resetCredits"], json!([]));
         assert_eq!(empty_credits.reset_credit_expires_at, None);
     }
 

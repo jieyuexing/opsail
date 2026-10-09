@@ -1161,7 +1161,38 @@ fn usage_reads_rate_limits_from_a_fake_codex_cli() {
         .assert()
         .success()
         .stderr("")
-        .stdout("Codex\t75% remaining\tplus\tresets 1786000000\n  primary\t75% remaining\t10080 min\tresets 1786000000\n  secondary\t0% remaining\t90.5 min\tresets 1786000100\n");
+        .stdout("Codex\t75% remaining\tplus\tresets 1786000000\n  primary\t75% remaining\t10080 min\tresets 1786000000\n  secondary\t0% remaining\t90.5 min\tresets 1786000100\n  reset credits\tunknown available\tearliest expiry unknown\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn usage_codex_reset_cards_project_json_and_text_without_identifiers() {
+    let directory = tempdir().unwrap();
+    let fake = fake_usage_codex(directory.path(), serde_json::json!({
+        "rateLimits": {"primary": {"usedPercent": 100}},
+        "rateLimitResetCredits": {"availableCount": 1, "credits": [
+            {"status": "available", "resetType": "codexRateLimits", "grantedAt": 100,
+             "expiresAt": 300, "id": "private-card-marker", "title": "private-card-marker"},
+            {"status": "redeemed", "resetType": "codexRateLimits", "grantedAt": 50,
+             "expiresAt": 200, "description": "private-card-marker"}
+        ]}
+    }));
+    let output = cargo_bin_cmd!("opsail").args(["usage", "codex", "--codex-path"])
+        .arg(&fake).assert().success().get_output().stdout.clone();
+    let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    let row = &report["providers"][0];
+    assert_eq!(row["resetCreditAvailableCount"], 1);
+    assert_eq!(row["resetCreditExpiresAt"], 300);
+    assert_eq!(row["resetCredits"][0]["expiresAt"], 200);
+    assert_eq!(row["resetCredits"][1]["expiresAt"], 300);
+    assert_eq!(row["resetCredits"][1].as_object().unwrap().len(), 4);
+    assert!(!String::from_utf8(output).unwrap().contains("private-card-marker"));
+    let output = cargo_bin_cmd!("opsail").args(["usage", "codex", "--format", "text", "--codex-path"])
+        .arg(&fake).assert().success().get_output().stdout.clone();
+    let text = String::from_utf8(output).unwrap();
+    assert!(text.contains("reset credits\t1 available\tearliest expiry 300"));
+    assert!(text.contains("available\tcodexRateLimits\tgranted 100\texpires 300"));
+    assert!(!text.contains("private-card-marker"));
 }
 
 #[cfg(unix)]
@@ -1236,7 +1267,7 @@ fn usage_codex_missing_or_null_secondary_does_not_invent_a_duration() {
             .assert()
             .success()
             .stderr("")
-            .stdout("Codex\t86% remaining\n  primary\t86% remaining\n");
+            .stdout("Codex\t86% remaining\n  primary\t86% remaining\n  reset credits\tunknown available\tearliest expiry unknown\n");
     }
 }
 

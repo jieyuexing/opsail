@@ -123,6 +123,30 @@ fn format_entry(entry: &UsageEntry) -> String {
                     }
                 }
             }
+            if entry.provider == UsageProvider::Codex {
+                let count = entry
+                    .reset_credit_available_count
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "unknown".to_owned());
+                let expiry = entry
+                    .reset_credit_expires_at
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "unknown".to_owned());
+                line.push_str(&format!(
+                    "\n  reset credits\t{count} available\tearliest expiry {expiry}"
+                ));
+                if let Some(credits) = &entry.reset_credits {
+                    for credit in credits {
+                        line.push_str(&format!(
+                            "\n    {}\t{}\tgranted {}\texpires {}",
+                            credit.status, credit.reset_type, credit.granted_at, credit.expires_at
+                        ));
+                    }
+                }
+            }
+            if let Some(fields) = &entry.unparsed_reset_fields {
+                line.push_str(&format!("\n  unparsed reset fields\t{}", fields.join(", ")));
+            }
             line
         }
         UsageStatus::Unavailable => {
